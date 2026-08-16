@@ -278,3 +278,73 @@ Payments in PayFlow transition through a series of states to handle delays, retr
 *   **REVERSED:** Undoing a completed transaction. A new transaction is created to credit the sender and debit the receiver.
 *   **EXPIRED:** The payment request remained unresolved in `PROCESSING` for too long.
     *   *Note:* `EXPIRED` does not automatically return money. It indicates timeout. If funds were debited during `PROCESSING` before timeout, the system must trigger a `REVERSED` state to return the funds.
+
+---
+
+## Reconciliation & Discrepancy Auditing
+
+Reconciliation is the process of comparing our internal system records (the database and immutable ledger) with another external source of truth to ensure consistency and correctness.
+
+```
+             RECONCILIATION
+                   │
+                   ▼
+          Compare two records
+                   │
+          ┌────────┴────────┐
+          ▼                 ▼
+       MATCH            MISMATCH
+          │                 │
+        Done         Investigate/Resolve
+                            │
+                  ┌─────────┼─────────┐
+                  ▼         ▼         ▼
+               Update    Reverse    Manual
+               state     money      review
+```
+
+### The Concept
+*   **Match:** When both records agree. E.g., PayFlow logs `PAY123` as `SUCCESS` for ₹500, and the external payment network logs `PAY123` as `SUCCESS` for ₹500.
+*   **Mismatch:** When status, amount, or details differ. E.g., PayFlow logs `PAY123` as `SUCCESS` for ₹500, but the external network logs it as `SUCCESS` for ₹450 (Amount Mismatch) or logs it as `FAILED` (Status Mismatch).
+
+### Handling Mismatches
+When a discrepancy is detected, the reconciliation system flags it for resolution based on the scenario:
+
+| Scenario | Local Status | External Status | Action |
+| :--- | :--- | :--- | :--- |
+| **Scenario A** | `PROCESSING` | `SUCCESS` | Update local transaction state: `PROCESSING` → `SUCCESS` and execute ledger balance changes. |
+| **Scenario B** | `SUCCESS` | `FAILED` | Investigate the root cause (e.g., timeout handling error) and perform a new **Reversal** / refund transaction to return the money. |
+| **Scenario C** | Any | Mismatched Amount | Halt automatic processing, flag the transaction, and route it to **Manual review**. |
+
+### Project Implementation (External Simulator)
+To simulate this process, PayFlow compares its database with an isolated external simulated payment network:
+
+```
+┌──────────────────────┐
+│       PayFlow        │
+│    Local Database    │
+└──────────┬───────────┘
+           │
+           │ Payment Request
+           ▼
+┌──────────────────────┐
+│ Fake Payment Network │
+│  External Simulator  │
+└──────────────────────┘
+```
+
+The fake network maintains its own records independent of our local system. Our reconciliation service pulls these records, checks for inconsistencies, and runs discrepancy logic:
+
+```
+             PAY123
+                │
+        ┌───────┴───────┐
+        ▼               ▼
+     PayFlow        External
+     SUCCESS         FAILED
+        │               │
+        └───────┬───────┘
+                ▼
+            MISMATCH -> Trigger Reversal & Alerts
+```
+
