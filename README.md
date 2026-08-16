@@ -450,5 +450,4 @@ Every payment operation in the PayFlow engine is tracked across three independen
 2.  **Ledger Layer (Money Movement):** The immutable accounting book. Every movement is recorded as double-entry ledger items (e.g., Rohit: `DEBIT ₹500`, Alice: `CREDIT ₹500`).
 3.  **Audit Layer (History of Actions):** The step-by-step security record of everything that occurred (e.g., `PAYMENT_INITIATED`, `MPIN_VERIFIED`, `RECONCILIATION_STARTED`, `MISMATCH_DETECTED`, `REVERSAL_CREATED`).
 
-> [!IMPORTANT]
-> **Fintech Core Principle:** Never rewrite history to make the present look correct. If an error occurs or a correction is needed, always write a new record (ledger/audit log) explaining what happened, preserving the historical timeline.
+**Fintech Core Principle:** Never rewrite history to make the present look correct. If an error occurs or a correction is needed, always write a new record (ledger/audit log) explaining what happened, preserving the historical timeline.
