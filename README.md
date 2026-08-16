@@ -348,3 +348,107 @@ The fake network maintains its own records independent of our local system. Our 
             MISMATCH -> Trigger Reversal & Alerts
 ```
 
+### Reconciliation vs. Resolution
+
+While **Reconciliation** is the analytical phase (detecting and classifying mismatches), **Resolution** is the operational phase (applying corrections to the ledger to fix those mismatches).
+
+```
+                External System
+                      │
+                      │ Reconciliation Data
+                      ▼
+              ┌─────────────────┐
+              │ Reconciliation  │
+              │     Engine      │
+              └────────┬────────┘
+                       │
+                 Compare Records
+                       │
+          ┌────────────┴────────────┐
+          │                         │
+       MATCH                    MISMATCH
+          │                         │
+      No Action               Classify Issue
+                                    │
+                           ┌────────┴────────┐
+                           │                 │
+                       Fee Difference    Actual Issue
+                           │                 │
+                       No Correction      Investigate
+                                             │
+                                      Resolution Decision
+                                             │
+                                  ┌──────────┴─────────┐
+                                  │                    │
+                              Reversal             Adjustment
+                                  │                    │
+                                  └────────┬───────────┘
+                                           │
+                                      New Ledger Entry
+```
+
+*   **Fee Difference:** A common mismatch is a discrepancy due to varying transaction/network fees. Often, no balance correction is needed.
+*   **Actual Issue:** A structural failure or processing discrepancy that requires investigation. The system makes a resolution decision (e.g., automated Reversal or manual Adjustment) and appends a **new ledger entry** to correct the balance.
+
+---
+
+## Audit Trails & Logging System
+
+Audit logs record the exact history of events, state changes, and actors surrounding a financial transaction. They serve as the "CCTV" of the system.
+
+### Actors in the System
+Audit events are created by distinct actors to ensure clear accountability:
+*   `USER`: The person initiating the action (e.g., Rohit sending money).
+*   `ADMIN`: A platform administrator investigating or overriding an issue.
+*   `API`: Automated system components responding to incoming webhooks.
+*   `PAYMENT_WORKER`: The worker queue executing transfers and state commitments.
+*   `RECONCILIATION_WORKER`: The worker identifying inconsistencies and triggers.
+*   `SYSTEM`: Core scheduler or fallback automation daemon.
+
+#### Example Event Object
+```json
+{
+  "timestamp": "2026-08-16T10:05:01Z",
+  "actorType": "SYSTEM",
+  "actorId": "reconciliation-worker",
+  "event": "RECONCILIATION_MISMATCH",
+  "details": { "transactionId": "PAY123", "mismatchType": "AMOUNT_MISMATCH" }
+}
+```
+
+### Timeline of a Discrepancy
+```
+10:00:01 ──► [USER / rohit] Payment initiated (PAYMENT_INITIATED)
+10:00:02 ──► [USER / rohit] MPIN verified (MPIN_VERIFIED)
+10:00:03 ──► [SYSTEM / payment-worker] Wallet debit completed (DEBIT_COMPLETED)
+10:00:03 ──► [SYSTEM / payment-worker] Transaction marked SUCCESS (PAYMENT_SUCCESS)
+10:05:00 ──► [SYSTEM / reconciliation-worker] Reconciliation started (RECONCILIATION_STARTED)
+10:05:01 ──► [SYSTEM / reconciliation-worker] Amount mismatch detected (MISMATCH_DETECTED)
+10:10:42 ──► [ADMIN / admin123] Investigation completed (DISCREPANCY_REVIEWED)
+10:10:43 ──► [SYSTEM / payment-worker] Reversal created (REVERSAL_CREATED)
+```
+
+---
+
+## The Three Layers of PayFlow
+
+Every payment operation in the PayFlow engine is tracked across three independent but connected layers:
+
+```
+                PAYMENT
+                   │
+       ┌───────────┼────────────┐
+       │           │            │
+       ▼           ▼            ▼
+   Transaction    Ledger      Audit
+       │           │            │
+   Business      Money        History
+    State        Movement      of Actions
+```
+
+1.  **Transaction Layer (Business State):** Stores the current business story and user-facing status of the payment intent (e.g., `PAY123`, amount: ₹500, status: `SUCCESS`).
+2.  **Ledger Layer (Money Movement):** The immutable accounting book. Every movement is recorded as double-entry ledger items (e.g., Rohit: `DEBIT ₹500`, Alice: `CREDIT ₹500`).
+3.  **Audit Layer (History of Actions):** The step-by-step security record of everything that occurred (e.g., `PAYMENT_INITIATED`, `MPIN_VERIFIED`, `RECONCILIATION_STARTED`, `MISMATCH_DETECTED`, `REVERSAL_CREATED`).
+
+> [!IMPORTANT]
+> **Fintech Core Principle:** Never rewrite history to make the present look correct. If an error occurs or a correction is needed, always write a new record (ledger/audit log) explaining what happened, preserving the historical timeline.
