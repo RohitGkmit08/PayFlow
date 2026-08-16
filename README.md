@@ -281,6 +281,68 @@ Payments in PayFlow transition through a series of states to handle delays, retr
 
 ---
 
+## Balance Reservations (Holds)
+
+When a user initiates a transaction (e.g., Rohit has a ₹1,000 balance and starts a ₹700 transfer), the external payment system may take up to 30 seconds to respond. During this delay, to prevent double-spending or overdrafts, the engine places a temporary hold on the transaction amount.
+
+```
+RESERVED
+   │
+   ├── SUCCESS ──► CAPTURE ──► money moves
+   │
+   ├── FAILED  ──► RELEASE ──► money becomes available
+   │
+   └── EXPIRED ──► RELEASE (unless external system actually committed the transaction)
+```
+
+### Double-Spending Prevention
+If a wallet has a total balance of ₹2,000 and the user initiates three parallel transfers:
+*   `PAY-A` = ₹500
+*   `PAY-B` = ₹700
+*   `PAY-C` = ₹300
+
+The system records:
+$$\text{Total Reserved} = 500 + 700 + 300 = \text{₹1,500}$$
+$$\text{Available Balance} = \text{Total Balance} - \text{Reserved Amount}$$
+$$\text{Available Balance} = 2,000 - 1,500 = \text{₹500}$$
+
+The user can only initiate another concurrent payment of up to ₹500.
+
+### Timeout Handling (EXPIRED States)
+*   **Merely Reserved:** If a payment expires without being committed or debited externally, the reservation is released (`RELEASE`).
+*   **Already Debited:** If money was debited but the transaction timed out locally, the system must hold the reservation, investigate the external simulator's state, and trigger a `REVERSED` state to refund/correct the balance.
+
+---
+
+## Limits & Risk Engine
+
+Before a transaction enters the ledger or places a balance hold, the engine evaluates whether the payment should be allowed based on business rules and security policies.
+
+```
+                    Payment Request
+                          │
+             ┌────────────┼────────────┐
+             ▼            ▼            ▼
+        Can afford?   Within limits?  Safe?
+             │            │            │
+          Balance       Limits        Risk
+```
+
+### 1. Balance Check
+Verifies if the sender has sufficient `Available Balance` (i.e., `Total Balance - Reserved Holds >= Transaction Amount`).
+
+### 2. Limits Engine
+Applies explicit, hardcoded business rule checks:
+*   **Per-Transaction Limits:** E.g., a maximum limit of ₹20,000 per payment (a request for ₹25,000 will be instantly rejected).
+*   **Daily Accumulative Limits:** E.g., a maximum limit of ₹50,000 per day. If a user has already sent ₹45,000 across multiple payments, attempting a new ₹10,000 transfer is rejected with `LIMIT_EXCEEDED` (since $45,000 + 10,000 = \text{₹55,000}$).
+*   **Velocity/Frequency Limits:** E.g., a maximum of 5 payments allowed in a rolling 10-minute window to prevent spam or automated abuse.
+
+### 3. Risk Engine
+Analyzes transaction characteristics to detect unusual activity.
+*   **Policy Decision:** Runs risk rules to output a decision: `ALLOW`, `VERIFY` (triggers step-up authentication, e.g., MPIN verification or biometric approval), `REVIEW` (routes to admin queue), or `REJECT` (blocks transaction).
+
+---
+
 ## Reconciliation & Discrepancy Auditing
 
 Reconciliation is the process of comparing our internal system records (the database and immutable ledger) with another external source of truth to ensure consistency and correctness.
