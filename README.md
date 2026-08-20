@@ -23,28 +23,28 @@ Here is a glossary of the key financial and technical terms used in the PayFlow 
 | **User** | A person using the PayFlow application. |
 | **Account** | The financial identity associated with a user. |
 | **Wallet** | A container showing available money for the user to spend. It is a cached view of money, not the absolute source of truth. |
-| **Available Balance** | The amount of money that can be spent immediately. |
-| **Blocked Balance** | Balance reserved for pending transactions (not spendable). |
+| **Available Balance** | The amount of money that can be spent immediately (`Total Balance - Blocked Balance`). |
+| **Blocked Balance** | Balance reserved or held for pending transactions (not spendable). |
 | **Total Balance** | The sum of Available Balance and Blocked Balance (`Available + Blocked`). |
 | **Ledger** | An immutable book of financial entries. Instead of editing history, every change is appended as a new record. |
 | **Ledger Entry** | A single financial movement of type `CREDIT` or `DEBIT`. |
 | **Double-Entry Accounting** | A system where every transaction must affect at least two accounts (a debit for one, a credit for the other) such that total debits equal total credits. |
 | **Transaction** | A business operation representing a physical movement of money between entities. |
 | **Transaction Ref ID** | A unique identifier for tracking and deduplicating a transaction. |
-| **Payment Intent** | An object used to track the payment process from start to finish, crucial for idempotency, retry handling, and status tracking. |
-| **Transaction State** | The current lifecycle state of a transaction (e.g., `INITIATED`, `PROCESSING`, `SUCCESS`). |
+| **Payment Intent** | An object used to track the payment process from start to finish. Essential for idempotency, retry handling, and payment confirmation flows. |
+| **Transaction State** | The current lifecycle state of a transaction (e.g., `INITIATED`, `PROCESSING`, `SUCCESS`, `FAILED`, `EXPIRED`, `REVERSED`). |
 | **Authorization** | The permission required to execute a transaction (e.g., MPIN, device verification, biometric approval). |
 | **Settlement** | The final exchange of money between financial entities (instant for wallets; bank-to-bank settlement is processed later via clearinghouses like NPCI/RBI). |
 | **Reversal** | Undoing a completed transaction by creating a new, opposing transaction (never by deleting the old transaction). |
 | **Atomicity** | The "all-or-nothing" property ensuring either all operations in a transaction succeed, or none do. |
-| **Idempotency** | The property where performing an action multiple times yields the same result as doing it once. Managed via an `Idempotency-Key` header. |
+| **Idempotency** | The property where performing an action multiple times yields the exact same result as doing it once. Managed via an `Idempotency-Key` header. |
 | **Concurrency** | The occurrence of multiple operations or transaction requests happening at the exact same time. |
 | **VPA / UPI-ID** | Virtual Payment Address (e.g., `rohit@payflow`) mapping to an underlying account or wallet. |
 | **PSP (Payment Service Provider)** | The app providing the payment interface (e.g., PayFlow, PhonePe, GooglePay). |
 | **Beneficiary** | The recipient receiving the money in a transaction. |
 | **Aggregation Pipeline** | A sequence of database operations used to process and transform financial data into analytics or insights. |
 | **Running Balance** | The calculated balance of an account after each individual ledger entry, useful for passbook-style audit trails. |
-| **Session** | An object representing a logged-in device (stores `userId`, `deviceId`, `refreshTokenHash`, `expiresAt`) to allow session revocation and rotation. |
+| **Session** | An object representing an active logged-in device session, facilitating authentication, multi-device tracking, and remote logout capabilities. |
 
 ---
 
@@ -148,7 +148,117 @@ This assertion check (`totalDebit === totalCredit`) must run and succeed before 
 
 ---
 
-## Atomicity & Failure Recovery
+## Session Management
+
+To protect user accounts and securely manage active connections, PayFlow implements secure session tracking per device.
+
+### Session Document Schema
+Each session is stored as a document containing the logged-in device's identifiers:
+```json
+{
+  "userId": "rohit",
+  "deviceId": "device_mac_9921",
+  "refreshTokenHash": "a9f39d1b... (SHA-256 hash of refresh token)",
+  "expiresAt": "2026-08-27T10:00:00Z"
+}
+```
+
+### Core Security Features
+- **Multi-Device Support:** A user can be logged in on multiple devices concurrently, each tracked by a unique `deviceId`.
+- **Single-Device Logout:** Revokes authentication for a specific device by removing its matching session object.
+- **All-Device Logout:** Forces re-authentication on all devices by deleting all session documents matching the user's `userId`.
+- **Token Rotation & Hashing:** Session checks enforce verification against hashed refresh tokens, protecting against replay and hijack attacks.
+
+---
+
+## Transaction Engine & Execution Lifecycle
+
+The PayFlow transaction pipeline executes sequentially to protect user funds, validate logic, and prevent consistency errors.
+
+```
+[Payment Request] ──► 1. [Limits & Risk checks] ──► 2. [Idempotency Verification] ──► 3. [Balance Hold (Reservation)] ──► 4. [Atomic Execution (with concurrency control)]
+```
+
+### 1. Limits & Risk Engine
+
+Before a transaction enters the ledger or places a balance hold, the engine evaluates whether the payment should be allowed based on business rules and security policies.
+
+```
+                    Payment Request
+                          │
+             ┌────────────┼────────────┐
+             ▼            ▼            ▼
+        Can afford?   Within limits?  Safe?
+             │            │            │
+          Balance       Limits        Risk
+```
+
+*   **Balance Check:** Verifies if the sender has sufficient `Available Balance` (i.e., `Total Balance - Reserved Holds >= Transaction Amount`).
+*   **Limits Engine:** Applies explicit business checks:
+    *   *Per-Transaction Limits:* Maximum limit of ₹20,000 per payment.
+    *   *Daily Accumulative Limits:* Maximum daily limit of ₹50,000. If a user has already sent ₹45,000, attempting a new ₹10,000 transfer is rejected with `LIMIT_EXCEEDED` (since $45,000 + 10,000 = \text{₹55,000}$).
+    *   *Velocity/Frequency Limits:* E.g., a maximum of 5 payments allowed in a rolling 10-minute window to prevent spam or automated abuse.
+*   **Risk Engine:** Evaluates transaction risk profiles and outputs a policy decision:
+    *   `ALLOW`: Proceed with the transaction.
+    *   `VERIFY`: Trigger step-up authentication (e.g., MPIN verification or biometric approval).
+    *   `REVIEW`: Route to admin review queue.
+    *   `REJECT`: Block the transaction.
+
+### 2. Idempotency Engine
+
+Idempotency ensures that performing the same transaction request multiple times yields the exact same result as doing it once. This protects against double-spend events caused by user double-clicks, network retries, or server crashes.
+
+> [!IMPORTANT]
+> **Idempotency vs. Concurrency:** Idempotency does *not* mean "Don't allow two payments at the same time." It means "Don't process the exact same payment request more than once."
+
+#### Deduplication Lifecycle
+When a request with an `Idempotency-Key` (e.g., `Idempotency-Key: key_txn_98765`) is received:
+
+```
+First Time Key is Seen:
+  Key doesn't exist
+         ↓
+  Process payment
+         ↓
+  Payment succeeds
+         ↓
+  Store key + Response payload
+```
+
+*   **Subsequent Submissions:** If the server sees the same key again, it skips the execution logic entirely and immediately returns the stored response payload, preventing double-debits.
+
+### 3. Balance Reservations (Holds)
+
+When a user initiates a transaction (e.g., Rohit has a ₹1,000 balance and starts a ₹700 transfer), the external payment system may take up to 30 seconds to respond. During this delay, to prevent double-spending or overdrafts, the engine places a temporary hold on the transaction amount.
+
+```
+RESERVED
+   │
+   ├── SUCCESS ──► CAPTURE ──► money moves
+   │
+   ├── FAILED  ──► RELEASE ──► money becomes available
+   │
+   └── EXPIRED ──► RELEASE (unless external system actually committed the transaction)
+```
+
+#### Double-Spending Prevention Example
+If a wallet has a total balance of ₹2,000 and the user initiates three parallel transfers:
+*   `PAY-A` = ₹500
+*   `PAY-B` = ₹700
+*   `PAY-C` = ₹300
+
+The system records:
+$$\text{Total Reserved} = 500 + 700 + 300 = \text{₹1,500}$$
+$$\text{Available Balance} = \text{Total Balance} - \text{Reserved Amount}$$
+$$\text{Available Balance} = 2,000 - 1,500 = \text{₹500}$$
+
+The user can only initiate another concurrent payment of up to ₹500.
+
+#### Timeout Handling (EXPIRED States)
+*   **Merely Reserved:** If a payment expires without being committed or debited externally, the reservation is released (`RELEASE`).
+*   **Already Debited:** If money was debited but the transaction timed out locally, the system must hold the reservation, investigate the external simulator's state, and trigger a `REVERSED` state to refund/correct the balance.
+
+### 4. Atomicity & Failure Recovery
 
 All balance updates and ledger entries for a single payment must be handled as one **Atomic Unit**. If any individual step fails (e.g., receiver's account is suspended, or system goes offline mid-operation), the entire set of changes must roll back automatically, leaving the balances untouched.
 
@@ -186,11 +296,9 @@ try {
 }
 ```
 
----
+### 5. Concurrency, Race Conditions & Mitigation
 
-## Concurrency, Race Conditions & Mitigation
-
-### The Double-Spend / Overdraft Problem
+#### The Double-Spend / Overdraft Problem
 When multiple transactions execute at the exact same time, a race condition can occur if they read the same initial state before writing their updates:
 
 ```
@@ -209,9 +317,9 @@ Time   Request A (Send ₹80)               Request B (Send ₹50)
 ```
 In this scenario, the user successfully sent ₹130, but their wallet balance ends up at ₹50 (or ₹20 if Request A wrote last). The system has allowed an overdraft and lost money.
 
-### Mitigations
+#### Mitigations
 
-#### 1. Atomic Database Updates (Failsafe Condition)
+##### A. Atomic Database Updates (Failsafe Condition)
 Instead of reading the balance into application memory, verifying it, and saving it, run atomic update operations directly in the database using conditional queries.
 *   **Vulnerable (Anti-pattern):**
     ```javascript
@@ -234,7 +342,7 @@ Instead of reading the balance into application memory, verifying it, and saving
     ```
     This ensures that the balance check (`$gte: amount`) and decrement (`$inc`) happen in a single, thread-safe database action.
 
-#### 2. Optimistic Concurrency Control (OCC)
+##### B. Optimistic Concurrency Control (OCC)
 For complex updates that cannot be easily done with a simple `$inc`, use version keys. Each document contains a version field (`version` or `__v`). When writing back, the database verifies that the version has not changed since it was read.
 ```javascript
 const wallet = await Wallet.findOne({ userId });
@@ -254,13 +362,11 @@ if (res.modifiedCount === 0) {
 }
 ```
 
-#### 3. Distributed/Pessimistic Locking
-In distributed systems or high-concurrency systems, transactions on the same wallet resource can be serialized using locking mechanisms.
+##### C. Distributed/Pessimistic Locking
+In distributed systems or high-concurrency environments, transactions on the same wallet resource can be serialized using locking mechanisms.
 *   **Redis Locks (Redlock):** A lock is acquired on the resource key `lock:wallet:<walletId>` before processing the transaction. Any parallel request trying to acquire the same lock will block or fail fast, preventing database-level contention entirely.
 
----
-
-## Payment Lifecycle & State Machine
+### 6. Payment Lifecycle & State Machine
 
 Payments in PayFlow transition through a series of states to handle delays, retries, and failures gracefully:
 
@@ -270,7 +376,7 @@ Payments in PayFlow transition through a series of states to handle delays, retr
                                  └──► [EXPIRED] ──► [REVERSED] (if debited)
 ```
 
-### State Definitions
+#### State Definitions
 *   **INITIATED:** The user has requested a payment. The payment intent is created, but no money has moved yet.
 *   **PROCESSING:** The system is waiting for network/bank confirmations, or processing database modifications.
 *   **SUCCESS:** The payment completed successfully. Balances are updated and ledger entries are locked.
@@ -279,71 +385,50 @@ Payments in PayFlow transition through a series of states to handle delays, retr
 *   **EXPIRED:** The payment request remained unresolved in `PROCESSING` for too long.
     *   *Note:* `EXPIRED` does not automatically return money. It indicates timeout. If funds were debited during `PROCESSING` before timeout, the system must trigger a `REVERSED` state to return the funds.
 
----
+### 7. Timeout Handling & Uncertain Outcomes (TIMEOUT)
 
-## Balance Reservations (Holds)
+A timeout during processing represents an uncertain transaction outcome. When an external network fails to respond within a given window (e.g., 10 seconds), the engine must **never assume failure**. Assuming failure and immediately releasing funds can lead to double-spending or overdrafts if the transaction eventually succeeds on the external network.
 
-When a user initiates a transaction (e.g., Rohit has a ₹1,000 balance and starts a ₹700 transfer), the external payment system may take up to 30 seconds to respond. During this delay, to prevent double-spending or overdrafts, the engine places a temporary hold on the transaction amount.
-
+#### The Mental Model
 ```
-RESERVED
-   │
-   ├── SUCCESS ──► CAPTURE ──► money moves
-   │
-   ├── FAILED  ──► RELEASE ──► money becomes available
-   │
-   └── EXPIRED ──► RELEASE (unless external system actually committed the transaction)
-```
-
-### Double-Spending Prevention
-If a wallet has a total balance of ₹2,000 and the user initiates three parallel transfers:
-*   `PAY-A` = ₹500
-*   `PAY-B` = ₹700
-*   `PAY-C` = ₹300
-
-The system records:
-$$\text{Total Reserved} = 500 + 700 + 300 = \text{₹1,500}$$
-$$\text{Available Balance} = \text{Total Balance} - \text{Reserved Amount}$$
-$$\text{Available Balance} = 2,000 - 1,500 = \text{₹500}$$
-
-The user can only initiate another concurrent payment of up to ₹500.
-
-### Timeout Handling (EXPIRED States)
-*   **Merely Reserved:** If a payment expires without being committed or debited externally, the reservation is released (`RELEASE`).
-*   **Already Debited:** If money was debited but the transaction timed out locally, the system must hold the reservation, investigate the external simulator's state, and trigger a `REVERSED` state to refund/correct the balance.
-
----
-
-## Limits & Risk Engine
-
-Before a transaction enters the ledger or places a balance hold, the engine evaluates whether the payment should be allowed based on business rules and security policies.
-
-```
-                    Payment Request
-                          │
-             ┌────────────┼────────────┐
-             ▼            ▼            ▼
-        Can afford?   Within limits?  Safe?
-             │            │            │
-          Balance       Limits        Risk
+            TIMEOUT
+               │
+               ▼
+      Don't assume failure
+               │
+               ▼
+     Keep money protected
+               │
+               ▼
+     Find out what happened
 ```
 
-### 1. Balance Check
-Verifies if the sender has sufficient `Available Balance` (i.e., `Total Balance - Reserved Holds >= Transaction Amount`).
+#### Walkthrough of a Timeout Scenario
+Suppose **Rohit** has a total balance of **₹1,000** and initiates a payment of **₹700**:
+1. **Reservation:** The system reserves ₹700.
+   - `Total Balance` = ₹1,000, `Reserved` = ₹700, `Available Balance` = ₹300.
+2. **External Call:** PayFlow sends transaction `PAY123` for ₹700 to the external system.
+3. **No Response:** After 10 seconds, the connection times out.
+4. **Transition to Uncertain State:** Conceptually, `PAY123` is marked as `PROCESSING` or `UNKNOWN` (not `FAILED`). The reserved ₹700 remains blocked.
 
-### 2. Limits Engine
-Applies explicit, hardcoded business rule checks:
-*   **Per-Transaction Limits:** E.g., a maximum limit of ₹20,000 per payment (a request for ₹25,000 will be instantly rejected).
-*   **Daily Accumulative Limits:** E.g., a maximum limit of ₹50,000 per day. If a user has already sent ₹45,000 across multiple payments, attempting a new ₹10,000 transfer is rejected with `LIMIT_EXCEEDED` (since $45,000 + 10,000 = \text{₹55,000}$).
-*   **Velocity/Frequency Limits:** E.g., a maximum of 5 payments allowed in a rolling 10-minute window to prevent spam or automated abuse.
+#### Resolution Mechanisms
+To discover the actual state of the transaction, the engine employs two primary mechanisms:
 
-### 3. Risk Engine
-Analyzes transaction characteristics to detect unusual activity.
-*   **Policy Decision:** Runs risk rules to output a decision: `ALLOW`, `VERIFY` (triggers step-up authentication, e.g., MPIN verification or biometric approval), `REVIEW` (routes to admin queue), or `REJECT` (blocks transaction).
+*   **Querying the External System (Direct Status API):**
+    The system queries the external provider's status endpoint: *"What is the status of PAY123?"*.
+    - **If SUCCESS:** The reservation is transitioned to `CAPTURE` and a `DEBIT` ledger entry is made. Rohit's final available balance is ₹300.
+    - **If FAILED:** The reservation is transitioned to `RELEASE`. Rohit's ₹700 hold is freed, making his available balance ₹1,000.
+*   **Reconciliation (Delayed Audits):**
+    If the external provider does not support real-time status queries or is down, the system waits for the external network's transaction records to arrive (e.g., end-of-day batch files). The reconciliation worker compares the local `PROCESSING`/`TIMEOUT` record with the external record:
+    - **Mismatch Found:** PayFlow sees `TIMEOUT`, External sees `SUCCESS` for ₹700.
+    - **Resolution:** The engine executes the correction flow to finalize the state.
 
----
+#### Unresolved/Investigating State
+If the transaction state still cannot be determined after querying and reconciliation:
+- The payment intent transitions to an `INVESTIGATING` status (e.g., `PAY123` status = `INVESTIGATING`).
+- The reserved funds remain protected and locked in accordance with business risk policy until manual verification or final reconciliation settles the dispute.
 
-## Reconciliation & Discrepancy Auditing
+### 8. Reconciliation & Discrepancy Auditing
 
 Reconciliation is the process of comparing our internal system records (the database and immutable ledger) with another external source of truth to ensure consistency and correctness.
 
@@ -365,11 +450,11 @@ Reconciliation is the process of comparing our internal system records (the data
                state     money      review
 ```
 
-### The Concept
+#### The Concept
 *   **Match:** When both records agree. E.g., PayFlow logs `PAY123` as `SUCCESS` for ₹500, and the external payment network logs `PAY123` as `SUCCESS` for ₹500.
 *   **Mismatch:** When status, amount, or details differ. E.g., PayFlow logs `PAY123` as `SUCCESS` for ₹500, but the external network logs it as `SUCCESS` for ₹450 (Amount Mismatch) or logs it as `FAILED` (Status Mismatch).
 
-### Handling Mismatches
+#### Handling Mismatches
 When a discrepancy is detected, the reconciliation system flags it for resolution based on the scenario:
 
 | Scenario | Local Status | External Status | Action |
@@ -378,7 +463,7 @@ When a discrepancy is detected, the reconciliation system flags it for resolutio
 | **Scenario B** | `SUCCESS` | `FAILED` | Investigate the root cause (e.g., timeout handling error) and perform a new **Reversal** / refund transaction to return the money. |
 | **Scenario C** | Any | Mismatched Amount | Halt automatic processing, flag the transaction, and route it to **Manual review**. |
 
-### Project Implementation (External Simulator)
+#### Project Implementation (External Simulator)
 To simulate this process, PayFlow compares its database with an isolated external simulated payment network:
 
 ```
@@ -410,7 +495,7 @@ The fake network maintains its own records independent of our local system. Our 
             MISMATCH -> Trigger Reversal & Alerts
 ```
 
-### Reconciliation vs. Resolution
+#### Reconciliation vs. Resolution
 
 While **Reconciliation** is the analytical phase (detecting and classifying mismatches), **Resolution** is the operational phase (applying corrections to the ledger to fix those mismatches).
 
