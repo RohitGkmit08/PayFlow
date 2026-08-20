@@ -539,6 +539,62 @@ While **Reconciliation** is the analytical phase (detecting and classifying mism
 
 ---
 
+## Settlement & Finalization (SETTLEMENT)
+
+Settlement is the process by which financial obligations between transacting parties are finalized and actual money is transferred between their respective financial institutions.
+
+> [!IMPORTANT]
+> **Key Principle:** Payment success is distinct from settlement completeness:
+> $$\text{PAYMENT SUCCESS} \neq \text{SETTLEMENT COMPLETE}$$
+> A successful payment signifies that the transaction has been authorized and captured locally. Settlement signifies that the underlying funds have physically shifted between banking networks.
+
+### The Flow
+```
+Payment Instruction
+        │
+        ▼
+     SUCCESS (Local authorization & record)
+        │
+        ▼
+Financial Obligations Created
+        │
+        ▼
+    SETTLEMENT (Obligation finalized)
+```
+
+### Settlement States
+To track this background process, settlements progress through their own lifecycle states:
+*   `PENDING`: The obligation is recorded but not yet cleared.
+*   `SETTLED`: The external bank or clearing system confirmed final clearing.
+*   `FAILED`: Settlement failed (requires rollback, reversal, or manual intervention).
+*   `INVESTIGATING`: Stuck in verification or requiring manual audit.
+
+```
+PENDING
+   │
+   ├── SETTLED
+   │
+   ├── FAILED
+   │
+   └── INVESTIGATING
+```
+
+### Ensuring Settlement Completion
+In production systems, settlement finalization is guaranteed using several layers:
+1. **Settlement Records:** Explicitly tracking unsettled obligations as separate entities in the database.
+2. **Background Workers:** Asynchronous worker queues that pull pending settlements and process them against external networks/clearers.
+3. **Retries:** Standardizing automated retries for temporary bank downtime (`PENDING` $\rightarrow$ `Retry` $\rightarrow$ `SETTLED`).
+4. **Monitoring & Alerts:** Paging engineers if a record remains `PENDING` for longer than a predefined window (e.g., $X$ minutes).
+5. **Reconciliation:** Running audits to verify local database settlement states against the external clearer's daily transaction settlement logs.
+
+### Project Implementation Model
+To simulate settlement in PayFlow, payments and settlements are kept as separate concepts:
+*   **Payment Event:** `PAY123` is marked `SUCCESS` when authorized.
+*   **Settlement Event:** A settlement record is initialized as `PENDING`.
+*   **Clearance Simulator:** A settlement background worker runs, transitions `PENDING` to `SETTLED` or `FAILED`, and the reconciliation engine compares PayFlow's records with a simulated external settlement database.
+
+---
+
 ## Audit Trails & Logging System
 
 Audit logs record the exact history of events, state changes, and actors surrounding a financial transaction. They serve as the "CCTV" of the system.
