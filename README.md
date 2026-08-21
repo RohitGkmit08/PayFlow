@@ -248,6 +248,81 @@ Each session is stored as a document containing the logged-in device's identifie
 
 ---
 
+## Fintech Authentication & Security
+
+To ensure high-grade security, data integrity, and compliance, PayFlow enforces a rigorous authentication and authorization model across both browser sessions and financial API endpoints.
+
+### 1. Multi-Stage Authentication Lifecycle
+* **Initial Login:** The user provides their `Email` and `Password`. The backend validates the credentials against the hashed password stored in the database. Upon success, a secure session is created.
+  $$\text{User Login} \rightarrow \text{Credentials Validated} \rightarrow \text{Session Created}$$
+* **Session vs. JWT:** Instead of standard client-side JWTs, PayFlow employs an HttpOnly cookie-based session verification pattern:
+  ```
+  Browser
+     │
+     │ HttpOnly Session Cookie (Session ID)
+     ▼
+  Access Token / Refresh Token
+     │
+     ▼
+  PayFlow Server
+     │
+     ▼
+  Session Lookup (Database validation)
+  ```
+* **Cookie Protection:** Set as `HttpOnly`, preventing client-side JavaScript from accessing session identifiers directly. To guarantee production-grade security, this should be paired with `Secure` flags (HTTPS only), appropriate `SameSite` policies, and CSRF protection.
+
+### 2. Token Lifecycle & Rotation
+* **Access Tokens:** Short-lived credentials (e.g., 15 minutes) used to access protected financial routes (e.g., `GET /wallet`, `POST /payments`, `GET /transactions`).
+* **Refresh Tokens:** Long-lived credentials stored securely and used solely to acquire new access tokens:
+  $$\text{Refresh Token} \rightarrow \text{Session Validation} \rightarrow \text{New Access Token}$$
+* **Refresh Token Rotation:** Every time a refresh token is used, it is rotated. A new refresh token is issued, and the previous one is revoked. If a revoked token is reused, the engine flags it as a potential token theft and automatically invalidates the entire session.
+  ```
+  Token A (Used) ──► Token B Issued (Token A becomes invalid)
+  ```
+
+### 3. MPIN (Mobile Personal Identification Number)
+For payment authorization, PayFlow implements a secondary security challenge similar to real-world UPI systems:
+* **MPIN Verification:** A 4- or 6-digit PIN used exclusively to authorize money movements, distinct from the account password.
+* **Storage:** Hashed using secure hashing algorithms; never stored in plaintext.
+* **Rate Limiting:** Failed attempts are tracked and rate-limited. Too many consecutive failures trigger a temporary account lock to prevent brute-force attacks.
+  $$\text{Account Authentication (Password)} \rightarrow \text{Payment Authorization (MPIN)}$$
+
+### 4. Transaction Authorization Flow
+Before any money is reserved or transferred, the request goes through multiple validation layers:
+```
+                    Payment Request
+                           │
+                           ▼
+                    Authentication (Session Check)
+                           │
+                           ▼
+                    Authorization (Permission Check)
+                           │
+                           ▼
+                    MPIN Verification
+                           │
+                           ▼
+                    Limits & Risk Engine
+                           │
+                           ▼
+                    Balance & Hold Reservation
+                           │
+                           ▼
+                    Payment Execution
+```
+
+### 5. Financial API Security Principles
+* **Independent Browser Contexts:** Each browser tab or profile maintains its own session, cookies, and authentication state (e.g., Browser A runs User 1, Incognito runs User 2).
+* **Never Trust the Frontend:** The backend must never rely on user identity parameters sent in the request body (e.g., `{ "sender": "rohit", "amount": 500 }`). Instead, the identity must be resolved server-side from the authenticated session.
+* **Security vs. Audit:** Security controls prevent unauthorized actions, while the audit system records all attempts (both successful and blocked) for future compliance and forensics.
+  ```
+  Initiate Request ──► Authentication/MPIN/Limits ──► [Success] ──► Execute Payment
+                               │
+                               └──► [Fail] ──► Reject & Log Audit Event
+  ```
+
+---
+
 ## Transaction Engine & Execution Lifecycle
 
 The PayFlow transaction pipeline executes sequentially to protect user funds, validate logic, and prevent consistency errors.
@@ -731,3 +806,50 @@ Every payment operation in the PayFlow engine is tracked across three independen
 3.  **Audit Layer (History of Actions):** The step-by-step security record of everything that occurred (e.g., `PAYMENT_INITIATED`, `MPIN_VERIFIED`, `RECONCILIATION_STARTED`, `MISMATCH_DETECTED`, `REVERSAL_CREATED`).
 
 **Fintech Core Principle:** Never rewrite history to make the present look correct. If an error occurs or a correction is needed, always write a new record (ledger/audit log) explaining what happened, preserving the historical timeline.
+
+---
+
+## MongoDB Aggregation Pipelines
+
+In fintech architectures, loading dashboards, generating passbooks, and analyzing transaction volume require aggregating massive amounts of data efficiently. PayFlow utilizes MongoDB Aggregation Pipelines to process, transform, and compute metrics directly inside the database engine.
+
+### Why Use Aggregation Pipelines?
+Instead of fetching thousands of raw records into the application memory and processing them in Node.js (which consumes significant bandwidth and CPU), aggregation pipelines process data in stages before returning only the final, computed result.
+
+### Conceptual Pipeline
+An aggregation pipeline passes documents through a sequence of stages:
+```
+  Transactions (Raw Documents)
+               │
+               ▼
+           $match (Filter by status/date)
+               │
+               ▼
+           $group (Group by sender/receiver)
+               │
+               ▼
+           Calculate (Sum, count, average)
+               │
+               ▼
+           $sort (Sort by total volume)
+               │
+               ▼
+            Result (Aggregated Analytics)
+```
+
+#### Example Scenario
+Suppose the database has the following transactions:
+* `PAY001` → ₹500
+* `PAY002` → ₹700
+* `PAY003` → ₹200
+* `PAY004` → ₹1,000
+
+To calculate the total transaction volume, the aggregation pipeline sums these values inside the database, returning a single result: `₹2,400`.
+
+### Key Aggregation Stages Used in PayFlow
+1. **`$match`:** Filters documents to pass only those matching specified conditions (e.g., status is `SUCCESS`, or timestamp is within the current day).
+2. **`$group`:** Groups input documents by a specified identifier (e.g., grouping transactions by `userId`) and computes accumulated values (such as `$sum` for total spent or `$avg` for average transaction amount).
+3. **`$sum`:** Calculates the cumulative mathematical sum of numeric values.
+4. **`$count`:** Counts the number of documents in a stage (e.g., counting failed vs. successful transactions).
+5. **`$sort`:** Sorts the resulting documents by a specific field (e.g., sorting users descending by their total transaction volume).
+6. **`$limit`:** Restricts the number of output documents (e.g., fetching only the top 10 users).
