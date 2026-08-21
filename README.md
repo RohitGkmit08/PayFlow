@@ -148,6 +148,83 @@ This assertion check (`totalDebit === totalCredit`) must run and succeed before 
 
 ---
 
+## Supported Payment Types & Categories
+
+PayFlow supports multiple transaction flows, each mapping to a specific real-world business need. While all payment types share the core backend engine (handling authentication, idempotency, state management, ledger entry creation, settlement, and audits), individual transaction flows implement their own distinct business rules.
+
+### Payment Engine Architecture
+```
+                                 PAYMENT ENGINE
+                                       │
+                         ┌─────────────┼─────────────┐
+                         │             │             │
+                        P2P           P2M         COLLECT
+                         │             │             │
+                         ├─────────────┼─────────────┤
+                                       │
+                                    REFUND
+                                       │
+                                    REVERSAL
+                                       │
+                                   ADD MONEY
+                                       │
+                                   WITHDRAWAL
+```
+
+### 1. Payment Categories
+We classify these payment types based on how they route money through the PayFlow ecosystem:
+
+*   **Internal Participant Transfers (Wallet-to-Wallet):**
+    *   **P2P (Person-to-Person):** Standard transfer between two PayFlow users (e.g., Rohit transfers ₹700 to Alice). The flow sequences through:
+        $$\text{Authenticate} \rightarrow \text{Check Limits/Risk} \rightarrow \text{Validate Balance} \rightarrow \text{Reserve Hold} \rightarrow \text{Capture} \rightarrow \text{Double-Entry Ledger} \rightarrow \text{Settlement}$$
+    *   **P2M (Person-to-Merchant):** Initiated when a user purchases from a merchant. This flow maps the destination to a `merchantId` instead of a user ID and supports platform fee rules, customized settlement terms, and merchant account routing.
+*   **Inbound Funding:**
+    *   **Add Money:** Funds enter the PayFlow system from an external funding source (e.g., bank account, credit card) and credit the user's wallet.
+*   **Outbound Liquidation:**
+    *   **Withdrawal:** Funds leave the PayFlow system, debiting the user's wallet and transferring it to their verified external bank account.
+*   **Return Flows:**
+    *   **Refund:** A completed transaction is returned to the sender. Can be full or partial (e.g., returning ₹700 out of a ₹1,000 transaction).
+    *   **Reversal:** Corrects a transaction that failed or timed out during execution. Unlike refunds, reversals are systemic corrections ensuring that funds are not stranded in an invalid state.
+*   **Requested Obligations:**
+    *   **Collect / Payment Request:** A request from a receiver to a sender to authorize a payment. The sender can choose to **Accept** (triggering a P2P/P2M flow) or **Decline** the request.
+
+### 2. Common Foundation for All Payment Flows
+Every transaction, regardless of type, is processed through a shared, standardized pipeline:
+
+```
+          COMMON FOUNDATION
+           Authentication
+                 │
+                 ▼
+             Validation
+                 │
+                 ▼
+            Idempotency
+                 │
+                 ▼
+            Limits / Risk
+                 │
+                 ▼
+         Balance Reservation
+                 │
+                 ▼
+             Transaction
+                 │
+                 ▼
+               Ledger
+                 │
+                 ▼
+             Settlement
+                 │
+                 ▼
+           Reconciliation
+                 │
+                 ▼
+               Audit
+```
+
+---
+
 ## Session Management
 
 To protect user accounts and securely manage active connections, PayFlow implements secure session tracking per device.
@@ -536,6 +613,62 @@ While **Reconciliation** is the analytical phase (detecting and classifying mism
 
 *   **Fee Difference:** A common mismatch is a discrepancy due to varying transaction/network fees. Often, no balance correction is needed.
 *   **Actual Issue:** A structural failure or processing discrepancy that requires investigation. The system makes a resolution decision (e.g., automated Reversal or manual Adjustment) and appends a **new ledger entry** to correct the balance.
+
+---
+
+## Settlement & Finalization (SETTLEMENT)
+
+Settlement is the process by which financial obligations between transacting parties are finalized and actual money is transferred between their respective financial institutions.
+
+> [!IMPORTANT]
+> **Key Principle:** Payment success is distinct from settlement completeness:
+> $$\text{PAYMENT SUCCESS} \neq \text{SETTLEMENT COMPLETE}$$
+> A successful payment signifies that the transaction has been authorized and captured locally. Settlement signifies that the underlying funds have physically shifted between banking networks.
+
+### The Flow
+```
+Payment Instruction
+        │
+        ▼
+     SUCCESS (Local authorization & record)
+        │
+        ▼
+Financial Obligations Created
+        │
+        ▼
+    SETTLEMENT (Obligation finalized)
+```
+
+### Settlement States
+To track this background process, settlements progress through their own lifecycle states:
+*   `PENDING`: The obligation is recorded but not yet cleared.
+*   `SETTLED`: The external bank or clearing system confirmed final clearing.
+*   `FAILED`: Settlement failed (requires rollback, reversal, or manual intervention).
+*   `INVESTIGATING`: Stuck in verification or requiring manual audit.
+
+```
+PENDING
+   │
+   ├── SETTLED
+   │
+   ├── FAILED
+   │
+   └── INVESTIGATING
+```
+
+### Ensuring Settlement Completion
+In production systems, settlement finalization is guaranteed using several layers:
+1. **Settlement Records:** Explicitly tracking unsettled obligations as separate entities in the database.
+2. **Background Workers:** Asynchronous worker queues that pull pending settlements and process them against external networks/clearers.
+3. **Retries:** Standardizing automated retries for temporary bank downtime (`PENDING` $\rightarrow$ `Retry` $\rightarrow$ `SETTLED`).
+4. **Monitoring & Alerts:** Paging engineers if a record remains `PENDING` for longer than a predefined window (e.g., $X$ minutes).
+5. **Reconciliation:** Running audits to verify local database settlement states against the external clearer's daily transaction settlement logs.
+
+### Project Implementation Model
+To simulate settlement in PayFlow, payments and settlements are kept as separate concepts:
+*   **Payment Event:** `PAY123` is marked `SUCCESS` when authorized.
+*   **Settlement Event:** A settlement record is initialized as `PENDING`.
+*   **Clearance Simulator:** A settlement background worker runs, transitions `PENDING` to `SETTLED` or `FAILED`, and the reconciliation engine compares PayFlow's records with a simulated external settlement database.
 
 ---
 
