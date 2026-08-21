@@ -148,6 +148,83 @@ This assertion check (`totalDebit === totalCredit`) must run and succeed before 
 
 ---
 
+## Supported Payment Types & Categories
+
+PayFlow supports multiple transaction flows, each mapping to a specific real-world business need. While all payment types share the core backend engine (handling authentication, idempotency, state management, ledger entry creation, settlement, and audits), individual transaction flows implement their own distinct business rules.
+
+### Payment Engine Architecture
+```
+                                 PAYMENT ENGINE
+                                       │
+                         ┌─────────────┼─────────────┐
+                         │             │             │
+                        P2P           P2M         COLLECT
+                         │             │             │
+                         ├─────────────┼─────────────┤
+                                       │
+                                    REFUND
+                                       │
+                                    REVERSAL
+                                       │
+                                   ADD MONEY
+                                       │
+                                   WITHDRAWAL
+```
+
+### 1. Payment Categories
+We classify these payment types based on how they route money through the PayFlow ecosystem:
+
+*   **Internal Participant Transfers (Wallet-to-Wallet):**
+    *   **P2P (Person-to-Person):** Standard transfer between two PayFlow users (e.g., Rohit transfers ₹700 to Alice). The flow sequences through:
+        $$\text{Authenticate} \rightarrow \text{Check Limits/Risk} \rightarrow \text{Validate Balance} \rightarrow \text{Reserve Hold} \rightarrow \text{Capture} \rightarrow \text{Double-Entry Ledger} \rightarrow \text{Settlement}$$
+    *   **P2M (Person-to-Merchant):** Initiated when a user purchases from a merchant. This flow maps the destination to a `merchantId` instead of a user ID and supports platform fee rules, customized settlement terms, and merchant account routing.
+*   **Inbound Funding:**
+    *   **Add Money:** Funds enter the PayFlow system from an external funding source (e.g., bank account, credit card) and credit the user's wallet.
+*   **Outbound Liquidation:**
+    *   **Withdrawal:** Funds leave the PayFlow system, debiting the user's wallet and transferring it to their verified external bank account.
+*   **Return Flows:**
+    *   **Refund:** A completed transaction is returned to the sender. Can be full or partial (e.g., returning ₹700 out of a ₹1,000 transaction).
+    *   **Reversal:** Corrects a transaction that failed or timed out during execution. Unlike refunds, reversals are systemic corrections ensuring that funds are not stranded in an invalid state.
+*   **Requested Obligations:**
+    *   **Collect / Payment Request:** A request from a receiver to a sender to authorize a payment. The sender can choose to **Accept** (triggering a P2P/P2M flow) or **Decline** the request.
+
+### 2. Common Foundation for All Payment Flows
+Every transaction, regardless of type, is processed through a shared, standardized pipeline:
+
+```
+          COMMON FOUNDATION
+           Authentication
+                 │
+                 ▼
+             Validation
+                 │
+                 ▼
+            Idempotency
+                 │
+                 ▼
+            Limits / Risk
+                 │
+                 ▼
+         Balance Reservation
+                 │
+                 ▼
+             Transaction
+                 │
+                 ▼
+               Ledger
+                 │
+                 ▼
+             Settlement
+                 │
+                 ▼
+           Reconciliation
+                 │
+                 ▼
+               Audit
+```
+
+---
+
 ## Session Management
 
 To protect user accounts and securely manage active connections, PayFlow implements secure session tracking per device.
