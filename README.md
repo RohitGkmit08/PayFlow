@@ -877,7 +877,7 @@ PayFlow operates a hybrid lifecycle model:
 graph TD
     Client[CLIENT] -->|POST /payments| API[EXPRESS API]
     
-    subgraph Synchronous Path
+    subgraph "Synchronous Path"
         API --> Auth[Authenticate]
         API --> Val[Validate Request]
         API --> MPIN[Verify MPIN]
@@ -889,7 +889,7 @@ graph TD
     Tx --> DB[(MongoDB Database)]
     Tx -->|Emit Event| Redis[(Redis / BullMQ)]
 
-    subgraph Asynchronous Path (Workers)
+    subgraph "Asynchronous Path (Workers)"
         Redis --> SettW[Settlement Worker]
         Redis --> RecW[Reconciliation Worker]
         Redis --> NotW[Notification Worker]
