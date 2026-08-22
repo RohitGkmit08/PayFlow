@@ -7,7 +7,7 @@ A production-style UPI-inspired wallet system built with the MERN stack. PayFlow
 ---
 
 ## Tech Stack
-
+a
 - **Frontend:** React (Vite), Vanilla CSS, React Query, Axios
 - **Backend:** Node.js, Express.js, MongoDB (Mongoose), Zod, JWT
 - **AI Layer:** Google Gemini API
@@ -31,8 +31,8 @@ Here is a glossary of the key financial and technical terms used in the PayFlow 
 | **Double-Entry Accounting** | A system where every transaction must affect at least two accounts (a debit for one, a credit for the other) such that total debits equal total credits. |
 | **Transaction** | A business operation representing a physical movement of money between entities. |
 | **Transaction Ref ID** | A unique identifier for tracking and deduplicating a transaction. |
-| **Payment Intent** | An object used to track the payment process from start to finish. Essential for idempotency, retry handling, and payment confirmation flows. |
-| **Transaction State** | The current lifecycle state of a transaction (e.g., `INITIATED`, `PROCESSING`, `SUCCESS`, `FAILED`, `EXPIRED`, `REVERSED`). |
+| **Payment Intent** | An object used to track the payment process from start to finish. Essential for idempotency, retry handling, and payment confirmation flows. Common states: `Initialized`, `Processing`, `Succeeded`, `Failed/Canceled`. |
+| **Transaction State** | The current processing state of a transaction (e.g., `INITIATED`, `VALIDATED`, `AUTHORIZED`, `PROCESSING`, `SUCCESS`, `FAILED`, `EXPIRED`, `REVERSED`). |
 | **Authorization** | The permission required to execute a transaction (e.g., MPIN, device verification, biometric approval). |
 | **Settlement** | The final exchange of money between financial entities (instant for wallets; bank-to-bank settlement is processed later via clearinghouses like NPCI/RBI). |
 | **Reversal** | Undoing a completed transaction by creating a new, opposing transaction (never by deleting the old transaction). |
@@ -853,3 +853,90 @@ To calculate the total transaction volume, the aggregation pipeline sums these v
 4. **`$count`:** Counts the number of documents in a stage (e.g., counting failed vs. successful transactions).
 5. **`$sort`:** Sorts the resulting documents by a specific field (e.g., sorting users descending by their total transaction volume).
 6. **`$limit`:** Restricts the number of output documents (e.g., fetching only the top 10 users).
+
+---
+
+## Event-Driven Architecture, Queues & Workers
+
+To ensure performance, loose coupling, and reliability under load, the PayFlow engine adopts an Event-Driven Architecture (EDA) to separate critical, immediate transaction validations from non-blocking, background tasks.
+
+### Core Concepts
+
+*   **Event:** A record indicating that a state change or an action has occurred (e.g., `PaymentCreated`, `PaymentSucceeded`, `PaymentFailed`). Events are emitted without expecting an immediate response from consumers.
+*   **Queue:** A message buffer (like Redis/BullMQ) that decouples event producers from consumers, allowing the workload to scale, absorb spikes in traffic, and handle temporary downstream outages.
+*   **Worker:** Background processes that dequeue tasks/events and execute them asynchronously (e.g., processing settlements, delivering notifications).
+
+### Hybrid Execution Path (Synchronous vs. Asynchronous)
+
+PayFlow operates a hybrid lifecycle model:
+
+1.  **Synchronous Path (Critical Decision Loop):** Executed immediately when a user requests a payment (e.g., `POST /payments`). The API must authenticate the user, validate request constraints, verify MPIN, run limits/risk checks, verify balance, create the transaction record, and reserve the funds. The client receives an immediate response (e.g., `PROCESSING` or `SUCCESS`).
+2.  **Asynchronous Path (Background Processing):** Once the critical path succeeds, a `PaymentSucceeded` event is published, triggering background workers to handle settlement, reconciliation, push notifications, and analytics.
+
+```mermaid
+graph TD
+    Client[CLIENT] -->|POST /payments| API[EXPRESS API]
+    
+    subgraph Synchronous Path
+        API --> Auth[Authenticate]
+        API --> Val[Validate Request]
+        API --> MPIN[Verify MPIN]
+        API --> Lim[Limits & Risk Checks]
+        API --> Bal[Balance Reservation]
+        API --> Tx[Create Transaction]
+    end
+
+    Tx --> DB[(MongoDB Database)]
+    Tx -->|Emit Event| Redis[(Redis / BullMQ)]
+
+    subgraph Asynchronous Path (Workers)
+        Redis --> SettW[Settlement Worker]
+        Redis --> RecW[Reconciliation Worker]
+        Redis --> NotW[Notification Worker]
+        Redis --> AnalW[Analytics Worker]
+    end
+
+    SettW -->|Execute Settlement| Ext[External Simulator]
+    RecW -->|Audits & Checks| ExtRec[External Records]
+```
+
+### Major Asynchronous Components
+
+#### 1. Settlement Pipeline
+Because local payment completion is independent of actual bank clearance ($\text{PAYMENT SUCCESS} \neq \text{SETTLEMENT COMPLETE}$), settlement is deferred to background jobs.
+*   **Worker Flow:** `PaymentSucceeded` event $\rightarrow$ Settlement Job added to Queue $\rightarrow$ Settlement Worker processes obligation against simulated external network.
+*   **Failure & Retries:** If the external system is down, the queue retries the job (e.g., using exponential backoff) rather than failing the transaction.
+
+#### 2. Reconciliation Engine
+Reconciliation audits records asynchronously to avoid blocking the user's payment request.
+*   **Worker Flow:** Periodically or upon event trigger, the Reconciliation Worker compares PayFlow's ledger states against the external network's transaction simulator logs.
+*   **Mismatch Classification:** If a mismatch is detected (e.g., status or amount discrepancy), a resolution flow is triggered asynchronously (creating corrective ledger entries or routing to manual admin review).
+
+#### 3. Notification Service
+Delivering user alerts (e.g., "₹700 sent successfully") is managed as a background task.
+*   **Decoupled Failure:** If the notification server/provider fails, the payment transaction remains unaffected and succeeds. The notification job is retried in the queue until delivery is successful.
+
+#### 4. Analytics & Risk Engine
+Loose coupling allows other business domains to consume events asynchronously.
+*   **Extensibility:** Adding metrics calculators, fraud analytics, or compliance reporting is done by subscribing new workers to existing event topics without modifying core payment route controllers.
+
+### Technology Stack & Architecture
+
+For the initial local execution, PayFlow uses **BullMQ** backed by **Redis**:
+
+```
+Node.js / Express (API)
+       │
+       ▼
+  Redis Server
+       │
+       ▼
+    BullMQ (Queue Manager)
+       │
+       ├── Settlement Queue
+       ├── Reconciliation Queue
+       ├── Notification Queue
+       └── Risk & Reporting Queue
+```
+
+*   **BullMQ Workers:** Dedicated background processes that manage task serialization, retries, delay windows, and concurrent job limits, preventing CPU/database contention on the main API server.
