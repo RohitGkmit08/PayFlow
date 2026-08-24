@@ -48,38 +48,121 @@ Here is a glossary of the key financial and technical terms used in the PayFlow 
 
 ---
 
-## Wallet vs. Ledger Architecture
+## Financial Accounting Model
 
-In fintech applications, maintaining speed and auditability requires separating user dashboards from the source of truth:
+PayFlow separates the **accounting model**, the **immutable ledger**, and the **fast balance view**.
 
-*   **Wallet (Cached View):** Mutable, optimized for extremely fast reads. Used to load dashboard balances quickly.
-*   **Ledger (Source of Truth):** Immutable, append-only, highly reliable audit trail. Balance can always be recalculated/rebuilt from the ledger history.
+```text
+                         ACCOUNT
+                            │
+                 ┌──────────┴──────────┐
+                 │                     │
+             LEDGER ENTRIES       BALANCE STATE
+                 │                     │
+          Immutable history          WALLET
+                                    Cached view
+```
 
-### Data Schemas
+### Account
 
-#### Wallet Schema Example
+An `Account` is the accounting identity that participates in financial transactions.
+
+Examples:
+
+```text
+ROHIT_WALLET_ACCOUNT
+ALICE_WALLET_ACCOUNT
+PLATFORM_REVENUE_ACCOUNT
+BANK_SUSPENSE_ACCOUNT
+SETTLEMENT_POOL_ACCOUNT
+```
+
+### Wallet
+
+The Wallet is a fast-access representation of current balance state used by the application. It is **not the immutable financial source of truth**.
+
+### Ledger
+
+The Ledger is immutable, append-only accounting history. A balance can be rebuilt from ledger history.
+
+### System Accounts
+
+External money entering or leaving PayFlow is represented through system accounts.
+
+Add Money ₹5,000:
+
+```text
+DEBIT   BANK_SUSPENSE       ₹5,000
+CREDIT  ROHIT_WALLET        ₹5,000
+```
+
+P2P transfer ₹700:
+
+```text
+DEBIT   ROHIT_WALLET        ₹700
+CREDIT  ALICE_WALLET        ₹700
+```
+
+P2P transfer with ₹20 platform fee:
+
+```text
+DEBIT   ROHIT_WALLET        ₹720
+CREDIT  ALICE_WALLET        ₹700
+CREDIT  PLATFORM_REVENUE     ₹20
+```
+
+### Money Representation
+
+PayFlow never stores monetary values as JavaScript floating-point amounts.
+
+All monetary values are stored as **integer minor units**.
+
+For INR:
+
+```text
+₹1       = 100 paise
+₹500     = 50000
+₹500.50  = 50050
+```
+
+Example:
+
+```json
+{
+  "amount": 50050,
+  "currency": "INR"
+}
+```
+
+Conversion to human-readable rupees happens only at the API/UI boundary.
+
+### Wallet Schema
+
 ```json
 {
   "_id": "W1",
   "userId": "rohit",
-  "availableBalance": 8500,
-  "blockedBalance": 0,
+  "accountId": "ACC_ROHIT",
+  "availableBalance": 850000,
   "updatedAt": "2026-08-14T10:00:00Z"
 }
 ```
 
-#### Ledger Entry Schema Example
+### Ledger Entry Schema
+
 ```json
 {
   "_id": "L3",
-  "walletId": "W1",
+  "accountId": "ACC_ROHIT",
   "transactionId": "TXN123",
   "entryType": "DEBIT",
-  "amount": 500,
-  "balanceAfter": 8500,
+  "amount": 50000,
+  "currency": "INR",
   "createdAt": "2026-08-14T10:00:00Z"
 }
 ```
+
+`balanceAfter` is not treated as the accounting source of truth. Passbook-style balances are derived from ledger history or maintained as a read model.
 
 ---
 
@@ -227,24 +310,47 @@ Every transaction, regardless of type, is processed through a shared, standardiz
 
 ## Session Management
 
-To protect user accounts and securely manage active connections, PayFlow implements secure session tracking per device.
+PayFlow uses **server-side sessions** as the primary authentication mechanism.
 
-### Session Document Schema
-Each session is stored as a document containing the logged-in device's identifiers:
+```text
+Browser
+   │
+   │ HttpOnly Secure Cookie
+   │ sessionId
+   ▼
+PayFlow API
+   │
+   ▼
+Session Lookup
+   │
+   ▼
+Authenticated User
+```
+
+### Session Document
+
 ```json
 {
+  "sessionId": "SES_123",
   "userId": "rohit",
-  "deviceId": "device_mac_9921",
-  "refreshTokenHash": "a9f39d1b... (SHA-256 hash of refresh token)",
-  "expiresAt": "2026-08-27T10:00:00Z"
+  "deviceId": "device_9921",
+  "expiresAt": "2026-08-27T10:00:00Z",
+  "revokedAt": null,
+  "createdAt": "2026-08-24T10:00:00Z",
+  "lastUsedAt": "2026-08-24T20:00:00Z"
 }
 ```
 
 ### Core Security Features
-- **Multi-Device Support:** A user can be logged in on multiple devices concurrently, each tracked by a unique `deviceId`.
-- **Single-Device Logout:** Revokes authentication for a specific device by removing its matching session object.
-- **All-Device Logout:** Forces re-authentication on all devices by deleting all session documents matching the user's `userId`.
-- **Token Rotation & Hashing:** Session checks enforce verification against hashed refresh tokens, protecting against replay and hijack attacks.
+
+- Multi-device support.
+- Single-device logout.
+- All-device logout.
+- Immediate server-side session revocation.
+- `HttpOnly`, `Secure`, and appropriate `SameSite` cookie settings.
+- CSRF protection for state-changing cookie-authenticated requests.
+
+JWT access/refresh tokens are treated as an alternative architecture, not a required part of the primary PayFlow implementation.
 
 ---
 
@@ -358,57 +464,96 @@ Before a transaction enters the ledger or places a balance hold, the engine eval
 
 ### 2. Idempotency Engine
 
-Idempotency ensures that performing the same transaction request multiple times yields the exact same result as doing it once. This protects against double-spend events caused by user double-clicks, network retries, or server crashes.
+Idempotency protects against duplicate financial operations caused by double-clicks, client retries, network retries, or uncertain server responses.
 
-> [!IMPORTANT]
-> **Idempotency vs. Concurrency:** Idempotency does *not* mean "Don't allow two payments at the same time." It means "Don't process the exact same payment request more than once."
+```text
+Idempotency
+= the same request has one financial effect
 
-#### Deduplication Lifecycle
-When a request with an `Idempotency-Key` (e.g., `Idempotency-Key: key_txn_98765`) is received:
-
-```
-First Time Key is Seen:
-  Key doesn't exist
-         ↓
-  Process payment
-         ↓
-  Payment succeeds
-         ↓
-  Store key + Response payload
+Concurrency control
+= different simultaneous requests remain financially correct
 ```
 
-*   **Subsequent Submissions:** If the server sees the same key again, it skips the execution logic entirely and immediately returns the stored response payload, preventing double-debits.
+### Idempotency Record
+
+Each operation stores:
+
+```text
+userId
+idempotencyKey
+requestFingerprint
+status
+transactionId
+response
+createdAt
+expiresAt
+```
+
+The combination of `(userId, idempotencyKey)` is protected by a unique database constraint.
+
+### Lifecycle
+
+```text
+Request
+   │
+   ▼
+Create Idempotency Record
+   │
+   ├── New
+   │     ↓
+   │   IN_PROGRESS
+   │     ↓
+   │   Execute payment
+   │     ↓
+   │   COMPLETED
+   │
+   └── Existing
+         │
+         ├── IN_PROGRESS → return processing response
+         └── COMPLETED → return original response
+```
+
+A reused key with a different request fingerprint is rejected.
 
 ### 3. Balance Reservations (Holds)
 
-When a user initiates a transaction (e.g., Rohit has a ₹1,000 balance and starts a ₹700 transfer), the external payment system may take up to 30 seconds to respond. During this delay, to prevent double-spending or overdrafts, the engine places a temporary hold on the transaction amount.
+Reservations are first-class database entities rather than only a numeric blocked-balance field.
 
+A reservation protects funds while an external operation is unresolved.
+
+### Reservation Document
+
+```json
+{
+  "reservationId": "RES123",
+  "accountId": "ACC_ROHIT",
+  "transactionId": "TXN123",
+  "amount": 70000,
+  "currency": "INR",
+  "status": "ACTIVE",
+  "expiresAt": "2026-08-24T21:00:00Z"
+}
 ```
-RESERVED
-   │
-   ├── SUCCESS ──► CAPTURE ──► money moves
-   │
-   ├── FAILED  ──► RELEASE ──► money becomes available
-   │
-   └── EXPIRED ──► RELEASE (unless external system actually committed the transaction)
+
+### Reservation Lifecycle
+
+```text
+ACTIVE
+  ├── CAPTURED
+  ├── RELEASED
+  └── EXPIRED
 ```
 
-#### Double-Spending Prevention Example
-If a wallet has a total balance of ₹2,000 and the user initiates three parallel transfers:
-*   `PAY-A` = ₹500
-*   `PAY-B` = ₹700
-*   `PAY-C` = ₹300
+- `ACTIVE`: funds are protected.
+- `CAPTURED`: the hold becomes part of the completed operation.
+- `RELEASED`: the hold is removed because the operation did not commit.
+- `EXPIRED`: the timeout window elapsed; expiry does not automatically imply failure if the external outcome is uncertain.
 
-The system records:
-$$\text{Total Reserved} = 500 + 700 + 300 = \text{₹1,500}$$
-$$\text{Available Balance} = \text{Total Balance} - \text{Reserved Amount}$$
-$$\text{Available Balance} = 2,000 - 1,500 = \text{₹500}$$
+If total balance is ₹2,000 and active reservations total ₹1,500:
 
-The user can only initiate another concurrent payment of up to ₹500.
-
-#### Timeout Handling (EXPIRED States)
-*   **Merely Reserved:** If a payment expires without being committed or debited externally, the reservation is released (`RELEASE`).
-*   **Already Debited:** If money was debited but the transaction timed out locally, the system must hold the reservation, investigate the external simulator's state, and trigger a `REVERSED` state to refund/correct the balance.
+```text
+Available Balance = ₹2,000 - ₹1,500 = ₹500
+```
 
 ### 4. Atomicity & Failure Recovery
 
@@ -522,13 +667,14 @@ In distributed systems or high-concurrency environments, transactions on the sam
 
 Payments in PayFlow transition through a series of states to handle delays, retries, and failures gracefully:
 
-```
+```text
  [INITIATED] ──► [PROCESSING] ──┬──► [SUCCESS]
                                  ├──► [FAILED]
                                  └──► [EXPIRED] ──► [REVERSED] (if debited)
 ```
 
 #### State Definitions
+
 *   **INITIATED:** The user has requested a payment. The payment intent is created, but no money has moved yet.
 *   **PROCESSING:** The system is waiting for network/bank confirmations, or processing database modifications.
 *   **SUCCESS:** The payment completed successfully. Balances are updated and ledger entries are locked.
@@ -536,6 +682,41 @@ Payments in PayFlow transition through a series of states to handle delays, retr
 *   **REVERSED:** Undoing a completed transaction. A new transaction is created to credit the sender and debit the receiver.
 *   **EXPIRED:** The payment request remained unresolved in `PROCESSING` for too long.
     *   *Note:* `EXPIRED` does not automatically return money. It indicates timeout. If funds were debited during `PROCESSING` before timeout, the system must trigger a `REVERSED` state to return the funds.
+
+### State Transition Enforcement
+
+Transaction states are enforced through an explicit transition table.
+
+```text
+INITIATED
+   │
+   ▼
+VALIDATED
+   │
+   ▼
+AUTHORIZED
+   │
+   ▼
+PROCESSING
+   ├── SUCCESS
+   ├── FAILED
+   ├── EXPIRED
+   └── INVESTIGATING
+
+SUCCESS
+   │
+   └── REVERSED
+```
+
+Examples of illegal transitions:
+
+```text
+SUCCESS  → INITIATED      ❌
+FAILED   → SUCCESS        ❌
+REVERSED → SUCCESS        ❌
+```
+
+A transition validates the current state, destination state, actor/source, and business conditions.
 
 ### 7. Timeout Handling & Uncertain Outcomes (TIMEOUT)
 
@@ -818,7 +999,7 @@ Instead of fetching thousands of raw records into the application memory and pro
 
 ### Conceptual Pipeline
 An aggregation pipeline passes documents through a sequence of stages:
-```
+```text
   Transactions (Raw Documents)
                │
                ▼
@@ -856,87 +1037,464 @@ To calculate the total transaction volume, the aggregation pipeline sums these v
 
 ---
 
-## Event-Driven Architecture, Queues & Workers
+## Event-Driven Architecture, Transactional Outbox & Workers
 
-To ensure performance, loose coupling, and reliability under load, the PayFlow engine adopts an Event-Driven Architecture (EDA) to separate critical, immediate transaction validations from non-blocking, background tasks.
+PayFlow uses asynchronous processing for work that does not need to block the user's critical payment decision.
 
-### Core Concepts
+### Why a Transactional Outbox?
 
-*   **Event:** A record indicating that a state change or an action has occurred (e.g., `PaymentCreated`, `PaymentSucceeded`, `PaymentFailed`). Events are emitted without expecting an immediate response from consumers.
-*   **Queue:** A message buffer (like Redis/BullMQ) that decouples event producers from consumers, allowing the workload to scale, absorb spikes in traffic, and handle temporary downstream outages.
-*   **Worker:** Background processes that dequeue tasks/events and execute them asynchronously (e.g., processing settlements, delivering notifications).
+Financial database changes and event publication cannot be treated as two unrelated writes.
 
-### Hybrid Execution Path (Synchronous vs. Asynchronous)
+Unsafe:
 
-PayFlow operates a hybrid lifecycle model:
-
-1.  **Synchronous Path (Critical Decision Loop):** Executed immediately when a user requests a payment (e.g., `POST /payments`). The API must authenticate the user, validate request constraints, verify MPIN, run limits/risk checks, verify balance, create the transaction record, and reserve the funds. The client receives an immediate response (e.g., `PROCESSING` or `SUCCESS`).
-2.  **Asynchronous Path (Background Processing):** Once the critical path succeeds, a `PaymentSucceeded` event is published, triggering background workers to handle settlement, reconciliation, push notifications, and analytics.
-
-```mermaid
-graph TD
-    Client[CLIENT] -->|POST /payments| API[EXPRESS API]
-    
-    subgraph Synchronous Path
-        API --> Auth[Authenticate]
-        API --> Val[Validate Request]
-        API --> MPIN[Verify MPIN]
-        API --> Lim[Limits & Risk Checks]
-        API --> Bal[Balance Reservation]
-        API --> Tx[Create Transaction]
-    end
-
-    Tx --> DB[(MongoDB Database)]
-    Tx -->|Emit Event| Redis[(Redis / BullMQ)]
-
-    subgraph Asynchronous Path (Workers)
-        Redis --> SettW[Settlement Worker]
-        Redis --> RecW[Reconciliation Worker]
-        Redis --> NotW[Notification Worker]
-        Redis --> AnalW[Analytics Worker]
-    end
-
-    SettW -->|Execute Settlement| Ext[External Simulator]
-    RecW -->|Audits & Checks| ExtRec[External Records]
+```text
+MongoDB Transaction
+        │
+        ├── Commit payment
+        └── Publish to Redis
 ```
+
+If the process crashes after the database commits but before Redis receives the event, the payment succeeds but background processing is never triggered.
+
+### Correct Architecture
+
+```text
+                     Payment Engine
+                           │
+                           ▼
+                   MongoDB Transaction
+                           │
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+        Transaction      Ledger       Outbox
+                                         │
+                                         ▼
+                                      COMMIT
+                                         │
+                                         ▼
+                                   Outbox Relay
+                                         │
+                                         ▼
+                                      BullMQ
+                                         │
+             ┌───────────────────────────┼─────────────────────┐
+             ▼                           ▼                     ▼
+        Settlement                 Reconciliation        Notification
+          Worker                       Worker               Worker
+```
+
+The transaction, ledger changes, reservation changes, and outbox event commit atomically.
+
+The relay publishes committed outbox events to BullMQ and safely retries publication.
+
+### Outbox Event
+
+```json
+{
+  "eventId": "EVT123",
+  "eventType": "PAYMENT_SUCCEEDED",
+  "aggregateType": "PAYMENT",
+  "aggregateId": "TXN123",
+  "correlationId": "CORR_8f31",
+  "payload": {
+    "transactionId": "TXN123"
+  },
+  "publishedAt": null,
+  "createdAt": "2026-08-24T20:00:00Z"
+}
+```
+
+### Hybrid Execution Path
+
+1. **Synchronous path:** authenticate, validate, authorize, check limits/risk, create the transaction, reserve funds, and commit the immediate financial state.
+2. **Outbox path:** persist events atomically with the transaction.
+3. **Relay path:** publish committed outbox events to BullMQ.
+4. **Worker path:** perform settlement, reconciliation, notification, reporting, and other asynchronous tasks.
+
+### Worker Idempotency
+
+Workers must tolerate at-least-once execution.
+
+```text
+Worker receives SETTLE_TXN123
+          │
+          ▼
+Already terminal?
+      │          │
+     YES         NO
+      │          │
+      ▼          ▼
+   No-op       Process
+```
+
+Workers:
+
+1. Identify the business operation uniquely.
+2. Check current state.
+3. Perform the operation only if it has not completed.
+4. Commit state changes atomically.
+5. Retry transient failures.
+6. Route permanently failing jobs to a dead-letter/review path.
+
+### Correlation IDs
+
+A correlation ID is propagated through:
+
+```text
+HTTP Request
+    ↓
+Transaction
+    ↓
+Outbox Event
+    ↓
+Queue Job
+    ↓
+Worker
+    ↓
+External Simulator
+    ↓
+Webhook
+    ↓
+Audit Event
+```
+
+This allows one payment journey to be reconstructed end-to-end.
 
 ### Major Asynchronous Components
 
-#### 1. Settlement Pipeline
-Because local payment completion is independent of actual bank clearance ($\text{PAYMENT SUCCESS} \neq \text{SETTLEMENT COMPLETE}$), settlement is deferred to background jobs.
-*   **Worker Flow:** `PaymentSucceeded` event $\rightarrow$ Settlement Job added to Queue $\rightarrow$ Settlement Worker processes obligation against simulated external network.
-*   **Failure & Retries:** If the external system is down, the queue retries the job (e.g., using exponential backoff) rather than failing the transaction.
+#### Settlement
 
-#### 2. Reconciliation Engine
-Reconciliation audits records asynchronously to avoid blocking the user's payment request.
-*   **Worker Flow:** Periodically or upon event trigger, the Reconciliation Worker compares PayFlow's ledger states against the external network's transaction simulator logs.
-*   **Mismatch Classification:** If a mismatch is detected (e.g., status or amount discrepancy), a resolution flow is triggered asynchronously (creating corrective ledger entries or routing to manual admin review).
-
-#### 3. Notification Service
-Delivering user alerts (e.g., "₹700 sent successfully") is managed as a background task.
-*   **Decoupled Failure:** If the notification server/provider fails, the payment transaction remains unaffected and succeeds. The notification job is retried in the queue until delivery is successful.
-
-#### 4. Analytics & Risk Engine
-Loose coupling allows other business domains to consume events asynchronously.
-*   **Extensibility:** Adding metrics calculators, fraud analytics, or compliance reporting is done by subscribing new workers to existing event topics without modifying core payment route controllers.
-
-### Technology Stack & Architecture
-
-For the initial local execution, PayFlow uses **BullMQ** backed by **Redis**:
-
-```
-Node.js / Express (API)
-       │
-       ▼
-  Redis Server
-       │
-       ▼
-    BullMQ (Queue Manager)
-       │
-       ├── Settlement Queue
-       ├── Reconciliation Queue
-       ├── Notification Queue
-       └── Risk & Reporting Queue
+```text
+PAYMENT_SUCCEEDED
+       ↓
+Outbox Event
+       ↓
+Settlement Queue
+       ↓
+Settlement Worker
+       ↓
+External Simulator
+       ↓
+SETTLED / FAILED / INVESTIGATING
 ```
 
-*   **BullMQ Workers:** Dedicated background processes that manage task serialization, retries, delay windows, and concurrent job limits, preventing CPU/database contention on the main API server.
+#### Reconciliation
+
+The Reconciliation Worker compares PayFlow records with the external simulator and classifies mismatches.
+
+#### Notification
+
+Notifications are isolated from financial processing. Provider failure does not roll back a successful payment.
+
+#### Analytics & Risk
+
+Additional workers can consume events for analytics, fraud analysis, reporting, and AI-assisted explanations without modifying core payment logic.
+
+### Technology Stack
+
+```text
+Node.js / Express API
+        │
+        ▼
+     MongoDB
+        │
+        ▼
+ Transactional Outbox
+        │
+        ▼
+   Outbox Relay
+        │
+        ▼
+ Redis + BullMQ
+        │
+        ├── Settlement Queue
+        ├── Reconciliation Queue
+        ├── Notification Queue
+        └── Risk / Reporting Queue
+```
+
+### Failure Scenarios
+
+- Database commit succeeds but relay crashes.
+- Relay publishes and crashes before marking the outbox event published.
+- Worker receives the same job more than once.
+- Worker crashes after the external operation succeeds.
+- Duplicate webhook arrives.
+- Webhook arrives out of order.
+- External status remains unknown.
+- Reconciliation discovers an amount mismatch.
+
+The architecture handles these through retries, idempotent no-ops, investigation, or explicit corrective transactions rather than duplicate money movement.
+
+---
+
+## External Callbacks / Webhooks
+
+The external simulator communicates through callbacks as well as status polling.
+
+PayFlow must safely handle:
+
+- Duplicate callbacks.
+- Delayed callbacks.
+- Out-of-order callbacks.
+- Invalid signatures.
+- Callbacks for terminal transactions.
+- Callbacks arriving after reconciliation.
+
+```text
+External Simulator
+       │
+       ▼
+POST /webhooks/payment
+       │
+       ▼
+Verify Signature
+       │
+       ▼
+Find Transaction
+       │
+       ▼
+Validate State Transition
+       │
+       ▼
+Apply Idempotently
+```
+
+A duplicate callback must create at most one financial effect.
+
+---
+
+## Refunds, Reversals & Adjustments
+
+Corrections never rewrite historical ledger entries. They create new transactions and ledger entries.
+
+### Parent Transaction Linkage
+
+```text
+Original TXN100
+₹1,000
+    │
+    ├── Refund TXN101 → ₹400
+    └── Refund TXN102 → ₹600
+```
+
+Total refunded cannot exceed the original amount.
+
+Rules:
+
+- A refund cannot exceed the original transaction amount.
+- A refund cannot refund another refund.
+- A reversal references the transaction it corrects.
+- Historical ledger entries remain immutable.
+- Corrections create new double-entry ledger movements.
+- Reconciliation adjustments are explicitly classified and audited.
+
+---
+
+## Financial Invariants & Correctness Checks
+
+PayFlow periodically verifies properties that must always remain true.
+
+### Double-Entry Invariant
+
+```text
+Total Debits = Total Credits
+```
+
+### System-Wide Invariant
+
+```text
+Total Debits = Total Credits
+```
+
+### Reservation Invariant
+
+Active reservations must not exceed the account's controlled balance.
+
+### Refund Invariant
+
+Cumulative refunds must never exceed the original transaction amount.
+
+### State Invariant
+
+Terminal transactions cannot move to unrelated states.
+
+Invariant checks run as background jobs and are also used in concurrency and failure tests.
+
+---
+
+## Correctness & Chaos Testing
+
+The project intentionally tests failure modes, not only happy paths.
+
+### Concurrent Transfers
+
+Assert:
+
+```text
+No negative spendable balance
+No lost ledger movement
+Debit = Credit
+Only permitted payments succeed
+```
+
+### Idempotency Storm
+
+Send many simultaneous requests with the same user, idempotency key, and request body.
+
+Assert:
+
+```text
+Exactly one financial operation
+```
+
+### Duplicate Webhooks
+
+Send:
+
+```text
+SUCCESS
+SUCCESS
+SUCCESS
+```
+
+Assert:
+
+```text
+One financial effect
+```
+
+### Out-of-Order Webhooks
+
+Send:
+
+```text
+FAILED
+SUCCESS
+```
+
+Assert that the explicit state machine rejects or safely handles the invalid transition.
+
+### Worker Crash
+
+Simulate a committed financial transaction, committed outbox event, worker crash, and retry.
+
+Assert eventual processing without duplicate financial effects.
+
+### Accounting Invariant
+
+After each scenario:
+
+```text
+Total Debit = Total Credit
+```
+
+---
+
+## Risk Engine & AI Layer
+
+The financial decision engine remains deterministic.
+
+```text
+Payment Request
+      │
+      ▼
+Deterministic Risk Engine
+      │
+      ├── ALLOW
+      ├── VERIFY
+      ├── REVIEW
+      └── REJECT
+      │
+      ▼
+Async AI Layer
+      │
+      ▼
+Explanation / Investigation / Reporting
+```
+
+AI must not directly mutate balances or bypass deterministic financial controls.
+
+---
+
+## Recommended Implementation Sequence
+
+The implementation follows the dependency order below:
+
+```text
+1.  Project Foundation
+        ↓
+2.  Authentication & Sessions
+        ↓
+3.  User / Account / Wallet Model
+        ↓
+4.  Money Representation & Financial Invariants
+        ↓
+5.  Ledger & Double-Entry Accounting
+        ↓
+6.  Transaction / Payment Intent State Machine
+        ↓
+7.  Idempotency
+        ↓
+8.  Reservations / Holds
+        ↓
+9.  Atomic Transactions
+        ↓
+10. Concurrency Control
+        ↓
+11. Payment Flows
+        ↓
+12. External Payment Simulator
+        ↓
+13. Timeout & Uncertain Outcomes
+        ↓
+14. Webhooks / Callbacks
+        ↓
+15. Settlement
+        ↓
+16. Transactional Outbox
+        ↓
+17. Redis / BullMQ / Workers
+        ↓
+18. Worker Idempotency & Retries
+        ↓
+19. Reconciliation
+        ↓
+20. Refunds / Reversals / Adjustments
+        ↓
+21. Audit Trails & Correlation IDs
+        ↓
+22. Invariant Checker
+        ↓
+23. MongoDB Aggregations / Analytics
+        ↓
+24. Risk Engine
+        ↓
+25. Correctness & Chaos Testing
+        ↓
+26. AI Layer
+```
+
+### Why this order?
+
+- Accounting must exist before payment flows.
+- State transitions must exist before timeout/retry handling.
+- Reservations and concurrency control must exist before realistic parallel payments.
+- The external simulator must exist before uncertain outcomes, settlement, and reconciliation can be exercised.
+- The outbox must exist before relying on reliable asynchronous workers.
+- Worker idempotency must exist before relying on retries.
+- Reconciliation depends on PayFlow records and an external source of truth.
+- AI comes last because it consumes already-correct financial data; it does not establish financial correctness.
+
+### Non-Negotiable Invariants
+
+1. Money is stored in integer minor units.
+2. Ledger entries are immutable.
+3. Every financial transaction is double-entry balanced.
+4. Duplicate requests cannot create duplicate financial effects.
+5. Concurrent requests cannot create an overdraft.
+6. Reservations protect unresolved funds.
+7. Invalid state transitions are rejected.
+8. Corrections create new ledger entries.
+9. Async workers are safe to retry.
+10. Reconciliation never rewrites historical records.
