@@ -7,7 +7,10 @@ app.use(cors());
 app.use(express.json());
 
 app.get('/', (req, res) => {
-  res.json({ message: 'PayFlow Backend' });
+  res.status(200).json({
+    message: 'PayFlow Backend',
+    status: 'running',
+  });
 });
 
 module.exports = app;
