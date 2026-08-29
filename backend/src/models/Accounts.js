@@ -10,12 +10,13 @@ const accountSchema = new mongoose.Schema(
     },
 
     accountType: {
+      // not every account has the smame purpose 
       type: String,
       enum: [
-        'USER_WALLET',
-        'BANK_SUSPENSE',
-        'PLATFORM_REVENUE',
-        'SETTLEMENT_POOL',
+        'USER_WALLET', // user's financial position inside payflow
+        'BANK_SUSPENSE', // funds linked with external movement whose accounting status may not yet be finalized
+        'PLATFORM_REVENUE', // money payflow earns from fees 
+        'SETTLEMENT_POOL', // funds involved in settlement between payflow and external system
       ],
       required: true,
     },

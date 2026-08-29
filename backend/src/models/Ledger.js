@@ -1,8 +1,11 @@
 const mongoose = require('mongoose');
 
 const ledgerEntrySchema = new mongoose.Schema(
+// A Transaction describes the business event. A LedgerEntry records the financial effect of that event on an Account.
+// Transactions can describe what happened; ledger entries prove how the accounting changed.
   {
     transactionId: {
+// Every ledger entry should be traceable back to the business event that produc
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Transaction',
       required: true,
@@ -10,6 +13,8 @@ const ledgerEntrySchema = new mongoose.Schema(
     },
 
     accountId: {
+//  Which financial account was affected? 
+//  why not wallet? Lets say platform adds a platform fees, that cannot be linked with a wallet.
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Account',
       required: true,
@@ -29,6 +34,7 @@ const ledgerEntrySchema = new mongoose.Schema(
     },
 
     currency: {
+// because number doesnot inherintly tell us about currency
       type: String,
       required: true,
       default: 'INR',
