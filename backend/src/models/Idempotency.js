@@ -1,6 +1,8 @@
 const mongoose = require('mongoose');
 
 const idempotencyKeySchema = new mongoose.Schema(
+// its job is to Make sure the same payment request doesn't cause the financial operation to execute more than once.
+// It's a unique identifier supplied by the client for a particular operation.
   {
     userId: {
       type: mongoose.Schema.Types.ObjectId,
