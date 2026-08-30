@@ -14,14 +14,25 @@ const registerSchema = z.object({
   email: z
     .string()
     .trim()
-    .email('Invalid email address')
-    .toLowerCase(),
+    .toLowerCase()
+    .email({ message: 'Invalid email address' })
+    .optional()
+    .or(z.literal('').transform(() => undefined)),
 
   password: z
     .string()
     .min(6, 'Password must contain at least 6 characters'),
 });
 
-module.exports = {
-  registerSchema,
-};
+const loginSchema = z.object({
+  email: z
+    .string()
+    .trim()
+    .email({ message: 'Invalid email address' })
+    .toLowerCase(),
+  password: z
+    .string()
+    .min(1, 'Password is required'),
+});
+
+module.exports = {registerSchema, loginSchema};
