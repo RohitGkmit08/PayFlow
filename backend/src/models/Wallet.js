@@ -6,8 +6,8 @@ const walletSchema = new mongoose.Schema(
       // it represents Which user does this wallet belong to? (ownership)
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
-      required: true,
-      unique: true,
+      required:true,
+      unique:true
     },
 
     accountId: {
