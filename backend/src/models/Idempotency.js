@@ -16,6 +16,9 @@ const idempotencyKeySchema = new mongoose.Schema(
     },
 
     requestFingerprint: {
+// A fingerprint of what the client actually asked PayFlow to do.
+// Same request → same fingerprint. Different request → different fingerprint.
+// idempotency key identifies the logical request (ABC123), The fingerprint proves what that request actually contained: ABC123 + "UserA + UserB --> Rs. 500" 
       type: String,
       required: true,
     },
@@ -28,12 +31,17 @@ const idempotencyKeySchema = new mongoose.Schema(
     },
 
     transactionId: {
+// Which financial transaction resulted?
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Transaction',
       default: null,
     },
 
     response: {
+// This stores the result of the original operation.
+// Suppose UserA made a payment, payment succeeded, server sends a response, NETWORK FAILURE, UserA does not recieve the response.
+// UserA's app doesnot know whether payment succeeded. So it retries the payment request, server finds ABC123 -> completed -> TXN123.
+// So instead of processing another payment, it can return the response.
       type: mongoose.Schema.Types.Mixed,
       default: null,
     },
