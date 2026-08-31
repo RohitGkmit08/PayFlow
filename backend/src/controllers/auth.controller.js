@@ -208,4 +208,35 @@ const login = async (req, res) => {
     }
 
 };
-module.exports = { register, login };
+
+const getMe = async (req, res) => {
+    try {
+        const user = await User.findById(req.userId).select(
+            "-hashPswd"
+        );
+
+        if (!user) {
+            return res.status(404).json({
+                message: "User not found"
+            });
+        }
+
+        return res.status(200).json({
+            user: {
+                id: user._id,
+                name: user.name,
+                phone: user.phone,
+                email: user.email,
+                status: user.status
+            }
+        });
+
+    } catch (err) {
+
+        return res.status(500).json({
+            message: "Internal server error"
+        });
+
+    }
+};
+module.exports = { register, login, getMe };
