@@ -23,6 +23,10 @@ const walletSchema = new mongoose.Schema(
       required: true,
       default: 0,
       min: 0,
+      validate: {
+        validator: Number.isInteger,
+        message: "balance must be an integer representing paise"
+      }
     },
   },
   {

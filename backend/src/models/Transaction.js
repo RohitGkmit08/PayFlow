@@ -35,6 +35,10 @@ const transactionSchema = new mongoose.Schema(
       type: Number,
       required: true,
       min: 1,
+      validate: {
+        validator: Number.isInteger,
+        message: "transaction amount must be an integer representing paise"
+      }
     },
 
     currency: {
