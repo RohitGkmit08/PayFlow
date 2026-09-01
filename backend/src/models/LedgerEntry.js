@@ -5,7 +5,7 @@ const ledgerEntrySchema = new mongoose.Schema(
 // Transactions can describe what happened; ledger entries prove how the accounting changed.
   {
     transactionId: {
-// Every ledger entry should be traceable back to the business event that produc
+// Every ledger entry should be traceable back to the business event that produced it.
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Transaction',
       required: true,
@@ -13,8 +13,8 @@ const ledgerEntrySchema = new mongoose.Schema(
     },
 
     accountId: {
-//  Which financial account was affected? 
-//  why not wallet? Lets say platform adds a platform fees, that cannot be linked with a wallet.
+// Which financial account was affected?
+// why not wallet? Lets say platform adds a platform fees, that cannot be linked with a wallet.
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Account',
       required: true,
@@ -28,9 +28,14 @@ const ledgerEntrySchema = new mongoose.Schema(
     },
 
     amount: {
+      // Amount is stored in paise, never rupees.
       type: Number,
       required: true,
       min: 1,
+      validate: {
+        validator: Number.isInteger,
+        message: 'Ledger amount must be an integer representing paise',
+      },
     },
 
     currency: {
