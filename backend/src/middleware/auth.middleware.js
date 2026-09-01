@@ -18,6 +18,16 @@ const authMiddleware = async(req, res, next) => {
 
         const session = await Session.findOne({sessionTokenHash});
 
+        // if session is found, then mongoDb might return -
+        // session = {
+        //     _id: "...",
+        //     userId: "64abc...",
+        //     sessionTokenHash: "...",
+        //     expiresAt: "...",
+        //     revokedAt: null
+        // }
+
+        // session.userId = "6523adcsd.......", so, this is the ID of the user who owns this session
         if(!session){
             return res.status(401).json({
                 message: "invalid session"
@@ -30,9 +40,20 @@ const authMiddleware = async(req, res, next) => {
             });
         }
 
-        req.userId = session.userId;
-        next();
+        // so we are taking session.userId and attach it to req.userId, now the request now carries the authenticated user's identity.
 
+        req.userId = session.userId;
+
+        // now - 
+            // req
+            // ├── cookies
+            // ├── headers
+            // ├── body
+            // ├── ...
+            // └── userId = "64abc..."
+
+        next();
+        // now the controller can access : req.userId
     }catch(err){
         return res.status(500).json({
             message: "internal server error"
