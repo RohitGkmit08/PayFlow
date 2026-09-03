@@ -1,16 +1,17 @@
-const mongoose = require("mongoose");
-
 const User = require("../models/User.js");
 const Account = require("../models/Accounts.js");
 const Wallet = require("../models/Wallet.js");
 const Transaction = require("../models/Transaction.js");
 const LedgerEntry = require("../models/LedgerEntry.js");
 
-const createP2P = async({senderUserId, receiverAccountId, amount}) => {
+// IDENTIFY --> VALIDATE --> CREATE --> MOVE --> RECORD --> COMPLETE
+
+const createP2P = async ({ senderUserId, receiverAccountId, amount }) => {
+
     // find sender 
     const senderUser = await User.findById(senderUserId);
-    if(!senderUser){
-        throw new Error("No such user found")
+    if (!senderUser) {
+        throw new Error("No such user found");
     }
 
     // find sender account
@@ -18,21 +19,21 @@ const createP2P = async({senderUserId, receiverAccountId, amount}) => {
         userId: senderUser._id,
         accountType: "USER_WALLET",
         status: "ACTIVE"
-    })
-    if(!senderAccount){
-        throw new Error("Sender account not found")
+    });
+    if (!senderAccount) {
+        throw new Error("Sender account not found");
     }
 
     // find sender wallet
     const senderWallet = await Wallet.findOne({
         userId: senderUser._id,
         accountId: senderAccount._id
-    })
-    if(!senderWallet){
-        throw new Error("sender wallet not found")
+    });
+    if (!senderWallet) {
+        throw new Error("Sender wallet not found");
     }
 
-    // find reciever account
+    // find receiver account
     const receiverAccount = await Account.findOne({
         _id: receiverAccountId,
         accountType: "USER_WALLET",
@@ -40,6 +41,14 @@ const createP2P = async({senderUserId, receiverAccountId, amount}) => {
     });
     if (!receiverAccount) {
         throw new Error("Receiver account not found");
+    }
+
+    // find receiver wallet
+    const receiverWallet = await Wallet.findOne({
+        accountId: receiverAccount._id
+    });
+    if (!receiverWallet) {
+        throw new Error("Receiver wallet not found");
     }
 
     // prevent self transfer 
@@ -65,18 +74,12 @@ const createP2P = async({senderUserId, receiverAccountId, amount}) => {
 
     // debit sender wallet 
     senderWallet.availableBalance -= amount;
+
     await senderWallet.save();
 
-    // find reciever wallet
-    const receiverWallet = await Wallet.findOne({
-        accountId: receiverAccount._id
-    });
-    if (!receiverWallet) {
-        throw new Error("Receiver wallet not found");
-    }
-
-    // credit reciever wallet
+    // credit receiver wallet
     receiverWallet.availableBalance += amount;
+
     await receiverWallet.save();
 
     // Create debit ledger entry
@@ -99,9 +102,10 @@ const createP2P = async({senderUserId, receiverAccountId, amount}) => {
 
     // mark successful transaction 
     transaction.status = "SUCCESS";
+
     await transaction.save();
 
     return transaction;
-}
+};
 
-module.exports = {createP2P}
+module.exports = { createP2P };
