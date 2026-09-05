@@ -14,7 +14,7 @@ const transactionSchema = new mongoose.Schema(
 
     type: {
       type: String,
-      enum: ['P2P_TRANSFER'],
+      enum: ['P2P_TRANSFER', 'ADD_MONEY'],
       required: true,
     },
 
