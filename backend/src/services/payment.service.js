@@ -29,6 +29,7 @@ const createP2P = async ({ senderUserId, receiverAccountId, amount }) => {
 
         session.startTransaction();
 
+        // identify
         const senderUser = await User.findById(senderUserId).session(session);
 
         if (!senderUser) {
@@ -72,13 +73,40 @@ const createP2P = async ({ senderUserId, receiverAccountId, amount }) => {
             throw new Error("Receiver wallet not found");
         }
 
+
+        // validate
+
+        // Prevent transferring money to the same account.
         if (senderAccount._id.equals(receiverAccount._id)) {
             throw new Error("Cannot transfer money to your own account");
         }
 
-        if (senderWallet.availableBalance < amount) {
-            throw new Error("Insufficient balance");
-        }
+        /*
+         * We no longer perform the balance check here.
+         *
+         * Instead, the balance check will be performed atomically
+         * together with the debit operation below.
+         *
+         * This prevents the following race:
+         *
+         *     READ balance
+         *          ↓
+         *     CHECK balance
+         *          ↓
+         *     another request changes balance
+         *          ↓
+         *     WRITE balance
+         *
+         * The condition:
+         *
+         *     availableBalance >= amount
+         *
+         * will now be part of the same database operation
+         * that performs the deduction.
+         */
+
+
+        // create
 
         /*
          * Create the Transaction record.
@@ -108,12 +136,104 @@ const createP2P = async ({ senderUserId, receiverAccountId, amount }) => {
         // so we extract the created Transaction document.
         const createdTransaction = transaction[0];
 
-        senderWallet.availableBalance -= amount;
-        await senderWallet.save({ session });
 
-        receiverWallet.availableBalance += amount;
-        await receiverWallet.save({ session });
+        // move
 
+        /*
+         * Debit the sender using an atomic conditional update.
+         *
+         * MongoDB will perform these two things as one atomic
+         * document update:
+         *
+         *     1. Check whether balance >= amount
+         *     2. Subtract amount from balance
+         *
+         * $gte means "greater than or equal to".
+         *
+         * $inc means "increment/decrement the existing value".
+         * Using -amount therefore subtracts the amount.
+         *
+         * { session } makes this operation part of our
+         * existing MongoDB transaction.
+         */
+        const senderDebit = await Wallet.updateOne(
+            {
+                _id: senderWallet._id,
+                availableBalance: { $gte: amount }
+            },
+            {
+                $inc: {
+                    availableBalance: -amount
+                }
+            },
+            {
+                session
+            }
+        );
+
+        /*
+         * If modifiedCount is 0, the wallet was not updated.
+         *
+         * In this case, the most likely reason is that the sender
+         * does not have enough balance.
+         *
+         * Throwing an error causes the transaction to enter
+         * the catch block, where abortTransaction() rolls back
+         * the Transaction record and any other changes.
+         */
+        if (senderDebit.modifiedCount === 0) {
+            throw new Error("Insufficient balance");
+        }
+
+
+        /*
+         * Credit the receiver using $inc.
+         *
+         * Unlike the sender, we don't need a balance condition
+         * because receiving money does not require sufficient
+         * existing balance.
+         *
+         * $inc performs:
+         *
+         *     receiver balance + amount
+         *
+         * as an atomic database update.
+         *
+         * The same session is used so this credit belongs
+         * to the same transaction as the sender debit.
+         */
+        const receiverCredit = await Wallet.updateOne(
+            {
+                _id: receiverWallet._id
+            },
+            {
+                $inc: {
+                    availableBalance: amount
+                }
+            },
+            {
+                session
+            }
+        );
+
+        /*
+         * The receiver wallet should have been found earlier.
+         *
+         * If the update somehow does not modify a document,
+         * treat it as a failure and abort the entire transaction.
+         */
+        if (receiverCredit.modifiedCount === 0) {
+            throw new Error("Failed to credit receiver wallet");
+        }
+
+
+        // record
+
+        /*
+         * Create DEBIT ledger entry.
+         *
+         * DEBIT means money left the sender's account.
+         */
         await LedgerEntry.create([{
             transactionId: createdTransaction._id,
             accountId: senderAccount._id,
@@ -122,6 +242,12 @@ const createP2P = async ({ senderUserId, receiverAccountId, amount }) => {
             currency: "INR"
         }], { session });
 
+
+        /*
+         * Create CREDIT ledger entry.
+         *
+         * CREDIT means money entered the receiver's account.
+         */
         await LedgerEntry.create([{
             transactionId: createdTransaction._id,
             accountId: receiverAccount._id,
@@ -130,23 +256,55 @@ const createP2P = async ({ senderUserId, receiverAccountId, amount }) => {
             currency: "INR"
         }], { session });
 
+
+        // complete
+
+        /*
+         * All financial operations have succeeded:
+         *
+         *     Sender debited
+         *     Receiver credited
+         *     Debit ledger created
+         *     Credit ledger created
+         *
+         * Mark the transaction as SUCCESS.
+         */
         createdTransaction.status = "SUCCESS";
         await createdTransaction.save({ session });
 
+
+        /*
+         * COMMIT
+         *
+         * Make all changes performed using this session permanent.
+         */
         await session.commitTransaction();
 
         return createdTransaction;
 
+
     } catch (err) {
 
+        /*
+         * ABORT
+         *
+         * If anything fails before commit, rollback all changes
+         * that belong to this transaction.
+         */
         await session.abortTransaction();
 
         throw err;
 
+
     } finally {
 
+        /*
+         * End the MongoDB session after the transaction
+         * has either been committed or aborted.
+         */
         await session.endSession();
     }
 };
 
-module.exports = {createP2P}
+module.exports = { createP2P };
+
