@@ -7,7 +7,7 @@ A production-style UPI-inspired wallet system built with the MERN stack. PayFlow
 ---
 
 ## Tech Stack
-a
+
 - **Frontend:** React (Vite), Vanilla CSS, React Query, Axios
 - **Backend:** Node.js, Express.js, MongoDB (Mongoose), Zod, JWT
 - **AI Layer:** Google Gemini API
