@@ -65,6 +65,15 @@ const createPayment = async (req, res) => {
 
     } catch (err) {
 
+        if(err.code === "TRANSACTION_COMMIT_UNKNOWN"){
+            return res.status(202).json({
+            // the server has successfully received and understood your request, but has not yet completed processing it
+                message: "payment status could not be confirmed",
+                status:"UNKNOWN",
+                transactionId: err.transactionId
+            })
+
+        }
         return res.status(500).json({
             message: "Internal server error"
         });

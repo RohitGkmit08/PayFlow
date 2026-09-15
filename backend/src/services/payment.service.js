@@ -9,7 +9,12 @@ const IdempotencyKey = require("../models/Idempotency.js");
 
 // IDENTIFY → VALIDATE → CREATE → MOVE → RECORD → COMPLETE
 
-const createP2P = async ({senderUserId, receiverAccountId,amount,idempotencyKey }) => {
+const createP2P = async ({
+    senderUserId,
+    receiverAccountId,
+    amount,
+    idempotencyKey
+}) => {
 
     /*
      * IDEMPOTENCY CHECK
@@ -25,17 +30,27 @@ const createP2P = async ({senderUserId, receiverAccountId,amount,idempotencyKey 
 
     if (existingKey) {
 
-        const existingTransaction = await Transaction.findById(existingKey.transactionId);
+        const existingTransaction = await Transaction.findById(
+            existingKey.transactionId
+        );
 
         if (!existingTransaction) {
-            throw new Error("Idempotency record points to a missing transaction");
+            throw new Error(
+                "Idempotency record points to a missing transaction"
+            );
         }
 
-        if (existingTransaction.status === "INITIATED" || existingTransaction.status === "PROCESSING") {
+        if (
+            existingTransaction.status === "INITIATED" ||
+            existingTransaction.status === "PROCESSING"
+        ) {
             throw new Error("Payment is already in progress");
         }
 
-        if (existingTransaction.status === "SUCCESS" || existingTransaction.status === "FAILED") {
+        if (
+            existingTransaction.status === "SUCCESS" ||
+            existingTransaction.status === "FAILED"
+        ) {
             return existingTransaction;
         }
 
@@ -51,7 +66,11 @@ const createP2P = async ({senderUserId, receiverAccountId,amount,idempotencyKey 
 
     const MAX_ATTEMPTS = 3;
 
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++){
+    for (
+        let attempt = 1;
+        attempt <= MAX_ATTEMPTS;
+        attempt++
+    ) {
 
         const session = await mongoose.startSession();
 
@@ -109,7 +128,9 @@ const createP2P = async ({senderUserId, receiverAccountId,amount,idempotencyKey 
             // VALIDATE
 
             if (senderAccount._id.equals(receiverAccount._id)) {
-                throw new Error("Cannot transfer money to your own account");
+                throw new Error(
+                    "Cannot transfer money to your own account"
+                );
             }
 
             // CREATE TRANSACTION
@@ -182,7 +203,9 @@ const createP2P = async ({senderUserId, receiverAccountId,amount,idempotencyKey 
                     });
 
                     if (!existingKey) {
-                        throw new Error("Idempotency key was not found after duplicate-key error");
+                        throw new Error(
+                            "Idempotency key was not found after duplicate-key error"
+                        );
                     }
 
                     /*
@@ -190,17 +213,25 @@ const createP2P = async ({senderUserId, receiverAccountId,amount,idempotencyKey 
                      * the winning request.
                      */
 
-                    const existingTransaction = await Transaction.findById(existingKey.transactionId);
+                    const existingTransaction =
+                        await Transaction.findById(
+                            existingKey.transactionId
+                        );
 
                     if (!existingTransaction) {
-                        throw new Error("Idempotency record points to a missing transaction");
+                        throw new Error(
+                            "Idempotency record points to a missing transaction"
+                        );
                     }
 
                     /*
                      * The winning request may still be processing.
                      */
 
-                    if ( existingTransaction.status === "INITIATED" || existingTransaction.status === "PROCESSING"){
+                    if (
+                        existingTransaction.status === "INITIATED" ||
+                        existingTransaction.status === "PROCESSING"
+                    ) {
                         throw new Error(
                             "Payment is already in progress"
                         );
@@ -213,7 +244,10 @@ const createP2P = async ({senderUserId, receiverAccountId,amount,idempotencyKey 
                      * the payment again.
                      */
 
-                    if (existingTransaction.status === "SUCCESS" || existingTransaction.status === "FAILED") {
+                    if (
+                        existingTransaction.status === "SUCCESS" ||
+                        existingTransaction.status === "FAILED"
+                    ) {
                         return existingTransaction;
                     }
 
@@ -327,7 +361,12 @@ const createP2P = async ({senderUserId, receiverAccountId,amount,idempotencyKey 
 
             const MAX_COMMIT_ATTEMPTS = 3;
 
-            for (let commitAttempt = 1; commitAttempt <= MAX_COMMIT_ATTEMPTS; commitAttempt++) {
+            for (
+                let commitAttempt = 1;
+                commitAttempt <= MAX_COMMIT_ATTEMPTS;
+                commitAttempt++
+            ) {
+
                 try {
 
                     await session.commitTransaction();
@@ -336,7 +375,12 @@ const createP2P = async ({senderUserId, receiverAccountId,amount,idempotencyKey 
 
                 } catch (err) {
 
-                    if ( err.hasErrorLabel && err.hasErrorLabel("UnknownTransactionCommitResult")){
+                    if (
+                        err.hasErrorLabel &&
+                        err.hasErrorLabel(
+                            "UnknownTransactionCommitResult"
+                        ))
+                    {
 
                         /*
                          * We don't know whether the commit
@@ -345,11 +389,18 @@ const createP2P = async ({senderUserId, receiverAccountId,amount,idempotencyKey 
                          * Retry ONLY COMMIT.
                          */
 
-                        if (commitAttempt < MAX_COMMIT_ATTEMPTS) {
+                        if (
+                            commitAttempt < MAX_COMMIT_ATTEMPTS
+                        ) {
                             continue;
                         }
 
-                        throw new Error("Transaction commit result remains unknown");
+                        err.code = "TRANSACTION_COMMIT_UNKNOWN";
+                        err.transactionId =
+                            createdTransaction.transactionId;
+                        err.idempotencyKey = idempotencyKey;
+
+                        throw err;
                     }
 
                     throw err;
@@ -361,13 +412,30 @@ const createP2P = async ({senderUserId, receiverAccountId,amount,idempotencyKey 
         } catch (err) {
 
             /*
+             * Commit outcome is unknown.
+             *
+             * Do NOT retry the payment and do NOT start
+             * another transaction.
+             */
+
+            if (err.code === "TRANSACTION_COMMIT_UNKNOWN") {
+                throw err;
+            }
+
+            /*
              * A transient transaction error means this
              * transaction attempt cannot safely continue.
              *
              * Abort it and start a completely new attempt.
              */
 
-            if ( err.hasErrorLabel && err.hasErrorLabel( "TransientTransactionError")){
+            if (
+                err.hasErrorLabel &&
+                err.hasErrorLabel(
+                    "TransientTransactionError"
+                )
+            ) {
+
                 if (session.inTransaction()) {
                     await session.abortTransaction();
                 }
@@ -395,7 +463,9 @@ const createP2P = async ({senderUserId, receiverAccountId,amount,idempotencyKey 
      * All transaction attempts were exhausted.
      */
 
-    throw new Error("Payment could not be completed after multiple attempts");
+    throw new Error(
+        "Payment could not be completed after multiple attempts"
+    );
 };
 
 module.exports = { createP2P };
