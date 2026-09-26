@@ -12,7 +12,8 @@ Built with **Node.js**, **Express**, and **MongoDB (Mongoose)**, this backend im
   - Inner commit retry loop handling `UnknownTransactionCommitResult` up to 3 attempts without repeating monetary operations.
   - Fail-safe `TRANSACTION_COMMIT_UNKNOWN` error escalation returning HTTP `202 Accepted` when commit status is ambiguous.
 - **Atomic Conditional Balance Updates**: Balance deductions use MongoDB conditional atomic operators (`$gte` and `$inc`) to eliminate race conditions and overdrafts under concurrent requests.
-- **Dual-Layer Idempotency Engine**: Supports client-supplied `Idempotency-Key` HTTP headers with pre-transaction checks, in-transaction duplicate key race resolution (`E11000`), in-progress request locking, and response replay.
+- **Durable Payment Tracking with PaymentIntent**: Dedicated `PaymentIntent` lifecycle model (`RECEIVED` → `PROCESSING` → `SUCCESS` / `FAILED`) created outside the financial MongoDB transaction to survive rollbacks, transient write conflicts, and ambiguous commits.
+- **Idempotency & Concurrent Race Resolution**: Strict idempotency using client-provided `Idempotency-Key` headers enforced via compound unique indexing (`{ userId, idempotencyKey }`), preventing double-payments and serializing concurrent duplicate attempts.
 - **Financial Velocity Controls**: Hard caps on single transactions (₹50k), cumulative daily top-ups (₹100k), and maximum wallet balance ceilings (₹200k).
 - **Stateful, Hashed Session Authentication**: Secure session-cookie authentication using SHA-256 token hashing and `HttpOnly` cookies.
 - **Runtime Schema Validation**: Zero-trust request validation powered by **Zod**.
@@ -28,8 +29,8 @@ Built with **Node.js**, **Express**, and **MongoDB (Mongoose)**, this backend im
   - [Financial Limits & Velocity Controls](#financial-limits--velocity-controls)
   - [Session Authentication Architecture](#session-authentication-architecture)
 - [Transaction Engine & Concurrency Safety](#transaction-engine--concurrency-safety)
-  - [The 6-Stage Payment Lifecycle](#the-6-stage-payment-lifecycle)
-  - [Dual-Layer Idempotency Engine](#dual-layer-idempotency-engine)
+  - [The End-to-End Payment Pipeline](#the-end-to-end-payment-pipeline)
+  - [Durable PaymentIntent Pattern & Idempotency Engine](#durable-paymentintent-pattern--idempotency-engine)
   - [Atomic Conditional Balance Updates](#atomic-conditional-balance-updates)
   - [Distributed Transaction Resilience & Retries](#distributed-transaction-resilience--retries)
   - [Unknown Commit Result & HTTP 202 Flow](#unknown-commit-result--http-202-flow)
@@ -54,7 +55,7 @@ Built with **Node.js**, **Express**, and **MongoDB (Mongoose)**, this backend im
 
 ### The Financial Accounting Model
 
-PayFlow enforces a strict separation between **identity**, **financial accounting entities**, **fast mutable balance state**, and **immutable transaction audit logs**:
+PayFlow enforces a strict separation between **identity**, **financial accounting entities**, **durable payment intent**, **fast mutable balance state**, and **immutable transaction audit logs**:
 
 ```text
                          USER (Identity & Auth)
@@ -64,17 +65,21 @@ PayFlow enforces a strict separation between **identity**, **financial accountin
                        (USER_WALLET, BANK_SUSPENSE,
                        PLATFORM_REVENUE, SETTLEMENT_POOL)
                                    │
-                   ┌────────────────┴────────────────┐
-                   ▼                                 ▼
-          LEDGER ENTRIES                     WALLET (Balance State)
-      (Immutable Append-Only Audit)          (Fast Mutable View for UI)
+        ┌──────────────────────────┼──────────────────────────┐
+        ▼                          ▼                          ▼
+  PAYMENT INTENT            LEDGER ENTRIES             WALLET (Balance)
+(Durable Request State)  (Immutable Audit Record)  (Fast Mutable Projection)
+        │                          │
+        └─────────────► TRANSACTION ◄─────────────┘
+                     (Financial Event)
 ```
 
 1. **User (`User`)**: Represents the human identity holding login credentials (`hashPswd`), phone number, and email.
 2. **Account (`Account`)**: The accounting identity participating in transactions. A user owns an account of type `USER_WALLET`. System accounts (`BANK_SUSPENSE`, `PLATFORM_REVENUE`, `SETTLEMENT_POOL`) represent platform entities and external banking integrations.
 3. **Wallet (`Wallet`)**: A fast, cached view of available funds for rapid user balance queries. **The wallet is a mutable projection, not the source of financial truth; the ledger is.** If wallet balances ever desynchronize, they can be reconstructed from ledger history.
-4. **Transaction (`Transaction`)**: Represents a high-level business event (`P2P_TRANSFER`, `ADD_MONEY`) along with its lifecycle state (`INITIATED` -> `PROCESSING` -> `SUCCESS` / `FAILED` / `REVERSED`).
-5. **Ledger Entry (`LedgerEntry`)**: The immutable proof of money movement following double-entry bookkeeping. Every financial event generates paired debit and credit entries that balance to zero.
+4. **PaymentIntent (`PaymentIntent`)**: The durable request state machine (`RECEIVED` → `PROCESSING` → `SUCCESS` / `FAILED`) created outside the financial transaction boundary. It ensures that payment requests, in-flight locks, and idempotency keys survive any transaction aborts, rollbacks, or network failures.
+5. **Transaction (`Transaction`)**: Represents a high-level business event (`P2P_TRANSFER`, `ADD_MONEY`) along with its lifecycle state (`INITIATED` -> `PROCESSING` -> `SUCCESS` / `FAILED` / `REVERSED`). Created inside the multi-document ACID transaction.
+6. **Ledger Entry (`LedgerEntry`)**: The immutable proof of money movement following double-entry bookkeeping. Every financial event generates paired debit and credit entries that balance to zero.
 
 ---
 
@@ -180,11 +185,25 @@ The core P2P payment service (`backend/src/services/payment.service.js`) impleme
                     │ (Header: Idempotency-Key: K)  │
                     └───────────────┬───────────────┘
                                     │
-                         [Idempotency Check]
-                        Key exists in DB for user?
-                        ├── Yes: IN_PROGRESS? ──► Error: "Payment is already in progress"
-                        │        SUCCESS/FAILED? ──► Return cached Transaction
-                        └── No: Proceed to Transaction Loop
+                    [1. Durable Idempotency Check]
+                 PaymentIntent exists for {userId, K}?
+                 ├── Yes:
+                 │   ├── PROCESSING? ──► Has transactionId? ──► Return cached Transaction
+                 │   │                                      └── Error: "Payment is already in progress"
+                 │   ├── SUCCESS? ──► Return cached Transaction
+                 │   └── FAILED? ──► Error: "Payment has already failed"
+                 └── No: Proceed
+                                    │
+                    [2. Pre-Transaction Resolution]
+                    Resolve Sender (User, Account, Wallet)
+                    Resolve Receiver (Account, Wallet)
+                    Validate Sender Account != Receiver Account
+                                    │
+                 [3. Create Durable PaymentIntent (Outside Session)]
+                    Insert PaymentIntent (status: "PROCESSING")
+                    ├── Duplicate Key (E11000 race)?
+                    │   └── Fetch existing PaymentIntent & resolve status
+                    └── Success ──► Proceed to Transaction Loop
                                     │
                                     ▼
                 ┌───────────────────────────────────────┐
@@ -193,13 +212,13 @@ The core P2P payment service (`backend/src/services/payment.service.js`) impleme
                 │     session.startTransaction()        │
                 └───────────────────┬───────────────────┘
                                     │
-             1. IDENTIFY ───────────┤ Resolve User, Account, Wallet for Sender & Receiver
-             2. VALIDATE ───────────┤ Sender != Receiver check
-             3. CREATE ─────────────┤ Insert Transaction ("INITIATED")
-             4. IDEMPOTENCY ────────┤ Insert IdempotencyKey (Catch duplicate key 11000)
+             1. IDENTIFY ───────────┤ Re-read Sender & Receiver within session (Snapshot Isolation)
+             2. VALIDATE ───────────┤ Re-assert Sender Account != Receiver Account
+             3. CREATE TXN ─────────┤ Insert Transaction (status: "INITIATED")
+             4. LINK INTENT ────────┤ Set paymentIntent.transactionId = txn._id (in session)
              5. MOVE ───────────────┤ Atomic Conditional Debit (availableBalance >= amount)
-                                    │ Credit Receiver Balance
-             6. RECORD ─────────────┤ Insert DEBIT & CREDIT LedgerEntry records
+                                    │ Credit Receiver Balance ($inc: amount)
+             6. RECORD ─────────────┤ Insert immutable DEBIT & CREDIT LedgerEntry records
              7. COMPLETE ───────────┤ Set Transaction status = "SUCCESS"
                                     │
                                     ▼
@@ -208,61 +227,139 @@ The core P2P payment service (`backend/src/services/payment.service.js`) impleme
                 │       session.commitTransaction()     │
                 └───────────────────┬───────────────────┘
                                     │
-             ├── Succeeded ─────────┴─► Return Transaction (200 OK)
+             ├── Commit Succeeded ──┴─► [Post-Commit Intent Finalization]
+             │                          Update PaymentIntent (status: "SUCCESS") outside session
+             │                          Return Transaction (200 OK)
              │
              ├── UnknownTransactionCommitResult?
-             │   ├── Retry Commit ONLY (attempt < 3)
+             │   ├── Retry Commit ONLY (commitAttempt < 3)
              │   └── Attempts Exhausted ──► Throw TRANSACTION_COMMIT_UNKNOWN
+             │                              ├── PaymentIntent remains "PROCESSING"
              │                              └── Controller returns 202 Accepted
              │
-             └── TransientTransactionError during operations?
-                 └── Abort transaction & Retry Whole Loop (attempt < 3)
+             ├── TransientTransactionError during operations?
+             │   └── Abort session & Retry Whole Transaction Loop (attempt < 3)
+             │
+             └── Other Error / Attempts Exhausted?
+                 ├── Abort active transaction session
+                 ├── Update PaymentIntent (status: "FAILED") outside session
+                 └── Throw Error
 ```
 
-### The 6-Stage Payment Lifecycle
+### The End-to-End Payment Pipeline
 
-Every P2P transfer strictly follows the sequence: **IDENTIFY → VALIDATE → CREATE → MOVE → RECORD → COMPLETE**:
+Every P2P transfer orchestrates a multi-phase flow that bridges durable pre-transaction intent, multi-document transactional isolation, and decoupled post-commit settlement:
 
-1. **`IDENTIFY`**:
-   - Resolves sender's `User`, active `USER_WALLET` `Account`, and `Wallet` using `req.userId`.
-   - Resolves receiver's active `USER_WALLET` `Account` and `Wallet` using `receiverAccountId`.
-   - All lookups are attached to the active MongoDB transaction session (`.session(session)`).
-2. **`VALIDATE`**:
-   - Asserts `!senderAccount._id.equals(receiverAccount._id)` to block self-transfers.
-3. **`CREATE`**:
-   - Generates a unique transaction identifier (`TXN-<timestamp>-<random>`).
-   - Inserts the `Transaction` document with `status: "INITIATED"` inside the session.
-4. **`IDEMPOTENCY`**:
-   - Attempts to insert `IdempotencyKey` record bound to `senderUserId` and `idempotencyKey` with a 24-hour expiration TTL.
-   - Handles concurrent request races (see [Dual-Layer Idempotency Engine](#dual-layer-idempotency-engine)).
-5. **`MOVE`**:
-   - Debits sender's balance using an atomic conditional update (`$gte` + `$inc`).
-   - Credits receiver's balance (`$inc`).
-6. **`RECORD`**:
-   - Inserts an immutable `DEBIT` `LedgerEntry` for the sender's account.
-   - Inserts an immutable `CREDIT` `LedgerEntry` for the receiver's account.
-7. **`COMPLETE`**:
-   - Updates `Transaction.status = "SUCCESS"`.
-   - Executes the commit retry loop (`session.commitTransaction()`).
+#### Phase 1: Pre-Transaction Durable Idempotency
+- Queries `PaymentIntent` for `{ userId: senderUserId, idempotencyKey }`.
+- **`PROCESSING`**: If a `transactionId` is already associated (e.g. from an earlier attempt whose response was lost), the service fetches and returns that transaction. If no `transactionId` is present, it throws `"Payment is already in progress"` to prevent concurrent duplicate execution.
+- **`SUCCESS`**: Fetches and returns the finalized `Transaction` immediately without touching wallets or ledgers.
+- **`FAILED`**: Throws `"Payment has already failed"` to prevent retrying a deterministic failure.
+
+#### Phase 2: Entity Pre-Resolution & Validation
+- **Sender Lookup**: Resolves sender's `User`, active `USER_WALLET` `Account`, and `Wallet` based on authenticated `req.userId` (injected via `authMiddleware`).
+- **Receiver Lookup**: Resolves receiver's active `USER_WALLET` `Account` and `Wallet` based on `receiverAccountId`.
+- **Pre-Validation**: Verifies `!senderAccount._id.equals(receiverAccount._id)` to block self-transfers before any database writes.
+
+#### Phase 3: Durable PaymentIntent Creation (Outside Session)
+- Persists a new `PaymentIntent` with `status: "PROCESSING"`, linking `senderAccountId`, `receiverAccountId`, `amount`, and `idempotencyKey`.
+- **Outside-Transaction Boundary**: Deliberately created **outside** the MongoDB transaction session. If the financial transaction later aborts or rolls back, the `PaymentIntent` survives, preserving request auditability and blocking concurrent duplicate retries.
+- **Race Condition Resolution**: If two identical requests hit the server simultaneously, MongoDB's compound unique index on `{ userId: 1, idempotencyKey: 1 }` triggers a duplicate key error (`E11000`) for the losing request. The loser catches this error, fetches the winning `PaymentIntent`, and safely returns the existing transaction or throws `"Payment is already in progress"`.
+
+#### Phase 4: Multi-Document ACID Financial Transaction
+Governed by an outer retry loop (`MAX_ATTEMPTS = 3`) handling transient replica set conflicts:
+1. **`IDENTIFY` (Transactional Isolation)**: Re-reads sender and receiver documents with `.session(session)`. This ensures that all balance checks and ledger entries participate in MongoDB's transactional snapshot isolation.
+2. **`VALIDATE`**: Re-asserts `senderAccount._id !== receiverAccount._id` inside the session.
+3. **`CREATE TRANSACTION`**: Generates a business event `Transaction` with unique ID (`TXN-<timestamp>-<random>`) and `status: "INITIATED"`.
+4. **`LINK INTENT`**: Assigns `paymentIntent.transactionId = createdTransaction._id` and saves within the session (`await paymentIntent.save({ session })`). If the financial transaction rolls back, this association rolls back with it, leaving the outer `PaymentIntent` unpolluted.
+5. **`MOVE` (Atomic Conditional Balance Updates)**:
+   - Debits sender's balance using atomic conditional criteria: `availableBalance: { $gte: amount }` with `$inc: { availableBalance: -amount }`. If `modifiedCount === 0`, throws `"Insufficient balance"`.
+   - Credits receiver's balance: `$inc: { availableBalance: amount }`. If `modifiedCount === 0`, throws `"Failed to credit receiver wallet"`.
+6. **`RECORD` (Immutable Double-Entry Ledger)**:
+   - Inserts a `DEBIT` `LedgerEntry` for the sender's account.
+   - Inserts a `CREDIT` `LedgerEntry` for the receiver's account.
+7. **`COMPLETE`**: Updates `Transaction.status = "SUCCESS"` and saves inside the session.
+
+#### Phase 5: Isolated Commit Retry Loop
+- Executes `session.commitTransaction()` within a dedicated commit loop (`MAX_COMMIT_ATTEMPTS = 3`).
+- If an `UnknownTransactionCommitResult` error is caught, **only the commit is retried**. The balance movements and ledger insertions are never repeated.
+- If commit retries are exhausted, the service flags `err.code = "TRANSACTION_COMMIT_UNKNOWN"` and throws.
+
+#### Phase 6: Post-Commit Intent Finalization (Outside Session)
+- Once the commit succeeds, funds have irreversibly moved.
+- The service updates `PaymentIntent` outside the transaction to `status: "SUCCESS"` and attaches `transactionId: createdTransaction._id`.
+- **Fault-Tolerant Decoupling**: If this update fails (e.g. temporary network blip to MongoDB), the error is caught and swallowed. The transaction has already committed, so the payment is never re-executed. Background reconciliation can align the `PaymentIntent` record later.
+- Returns the committed `Transaction` to the caller (`HTTP 200 OK`).
+
+#### Phase 7: Resilient Error Escalation & Rollback
+- **`TRANSACTION_COMMIT_UNKNOWN`**: Caught by the outer loop and rethrown without retrying. The controller returns **HTTP 202 Accepted**. The `PaymentIntent` intentionally remains in `"PROCESSING"` status.
+- **`TransientTransactionError`**: Aborts active transaction and restarts the outer loop cleanly with a fresh session (up to 3 times).
+- **Non-Retryable Errors / Exhausted Attempts**: Aborts active transaction and updates `PaymentIntent.status = "FAILED"` outside the session so subsequent retries are rejected with `"Payment has already failed"`.
 
 ---
 
-### Dual-Layer Idempotency Engine
+### Durable PaymentIntent Pattern & Idempotency Engine
 
 Payment APIs must guarantee that duplicate HTTP requests (from client retries, double-clicks, or dropped connections) never trigger duplicate fund transfers:
 
-#### Layer 1: Pre-Transaction Cache Check
-Before opening a database session, the service checks if an `IdempotencyKey` already exists for `{ userId: senderUserId, key: idempotencyKey }`:
-- **If transaction is still in progress** (`INITIATED` or `PROCESSING`), it immediately throws `"Payment is already in progress"` to prevent concurrent re-entrancy.
-- **If transaction already succeeded or failed** (`SUCCESS` or `FAILED`), it bypasses the transaction logic and returns the existing transaction result immediately.
+#### 1. Why In-Transaction Idempotency Fails in Distributed Systems
+In traditional transaction architectures, idempotency records are written inside the transaction session. This creates a critical design flaw:
+- If a transaction aborts (e.g., due to write conflicts, insufficient balance, or a network timeout), **the idempotency record is rolled back alongside the financial operations**.
+- The database loses all record that an attempt occurred.
+- A subsequent retry arrives with a clean slate, creating vulnerability to duplicate charges or untraceable processing states.
+- If commit outcome is unknown (`UnknownTransactionCommitResult`), the server cannot safely record status inside the session.
 
-#### Layer 2: In-Transaction Concurrent Race Resolution
-If two identical requests arrive simultaneously, both might pass the pre-transaction check. Inside the transaction session, both attempt to insert an `IdempotencyKey`. The compound unique index on `{ userId: 1, key: 1 }` guarantees that only one succeeds:
-1. The losing request catches MongoDB duplicate-key error (`err.code === 11000`).
-2. The losing transaction is immediately rolled back (`session.abortTransaction()`).
-3. It fetches the idempotency record and associated transaction created by the winning request.
-4. If the winning request is still processing, it returns `"Payment is already in progress"`.
-5. If the winning request has completed (`SUCCESS` or `FAILED`), it returns the completed transaction result to the caller.
+#### 2. The PaymentIntent Solution: Decoupled Lifecycle Tracking
+PayFlow solves this by decoupling **payment intent** from **ledger execution**:
+- The `PaymentIntent` document is created **prior to and outside** the financial transaction.
+- It acts as an immutable durable anchor that survives transaction aborts, rollbacks, and replica set failovers.
+
+```text
+PaymentIntent States:
+[RECEIVED] ──► [PROCESSING] ──┬──(Commit Succeeded)──► [SUCCESS]
+                              │
+                              ├──(Non-Retryable Error)──► [FAILED]
+                              │
+                              └──(Commit Unknown)──────► [PROCESSING (Awaiting Reconciliation)]
+```
+
+- **`RECEIVED`**: Default schema state prior to execution.
+- **`PROCESSING`**: Intent established; financial transaction in-flight or commit status pending reconciliation.
+- **`SUCCESS`**: Financial transaction committed; funds transferred; linked to `Transaction._id`.
+- **`FAILED`**: Aborted due to business rule validation, insufficient balance, or exhausted retry attempts.
+
+#### 3. Concurrent Race Serialization via Unique Compound Index
+The `PaymentIntent` collection enforces a compound unique index:
+```javascript
+paymentIntentSchema.index(
+    { userId: 1, idempotencyKey: 1 },
+    { unique: true }
+);
+```
+When two identical requests arrive simultaneously:
+1. The first request successfully inserts the `PaymentIntent` with status `"PROCESSING"` and claims ownership of the transaction execution.
+2. The concurrent duplicate request fails with MongoDB duplicate key error `E11000`.
+3. The catch block handles `E11000` by querying the existing `PaymentIntent`:
+   - If still `"PROCESSING"`, it returns `"Payment is already in progress"`.
+   - If already completed (`"SUCCESS"`), it retrieves the finalized `Transaction` and returns it immediately.
+   - If already marked `"FAILED"`, it returns `"Payment has already failed"`.
+
+#### 4. Post-Commit Asynchronous Decoupling & Reconciliation Safety
+Once `session.commitTransaction()` succeeds, the financial truth (the ledger and wallet balances) is durable in the database.
+- Updating `PaymentIntent` to `"SUCCESS"` occurs outside the transaction in an isolated `try/catch`.
+- If an unexpected error occurs while updating `PaymentIntent`, the error is swallowed:
+  ```javascript
+  try {
+      await PaymentIntent.findByIdAndUpdate(paymentIntent._id, {
+          status: "SUCCESS",
+          transactionId: createdTransaction._id
+      });
+  } catch (err) {
+      // Payment has committed; failure to update intent must NOT re-execute payment.
+      // PaymentIntent can be repaired later by reconciliation.
+  }
+  ```
+  This ensures that an auxiliary status update failure never causes an already-committed financial transaction to fail or be re-executed.
 
 ---
 
@@ -303,7 +400,7 @@ In a distributed MongoDB replica set, transient network partitions or write lock
 - If an operation within the transaction throws an error containing the MongoDB label `TransientTransactionError` (such as a concurrent write conflict or primary election):
   - The failed transaction is safely aborted (`session.abortTransaction()`).
   - The session is discarded and a fresh session is initialized.
-  - The entire 6-stage lifecycle is retried cleanly.
+  - The transactional execution attempt is retried cleanly up to `MAX_ATTEMPTS = 3`.
 
 #### 2. Commit-Only Retries (`UnknownTransactionCommitResult`)
 - Governed by `MAX_COMMIT_ATTEMPTS = 3`.
@@ -322,7 +419,8 @@ If all 3 commit attempts fail to confirm the commit outcome:
    err.idempotencyKey = idempotencyKey;
    ```
 2. The outer transaction retry catch recognizes `err.code === "TRANSACTION_COMMIT_UNKNOWN"` and intentionally avoids retrying the transaction, preserving ledger integrity.
-3. The payment controller catches this error and responds with **HTTP 202 Accepted**:
+3. The `PaymentIntent` record intentionally remains in `status: "PROCESSING"`. Because the durable intent is created outside the session, its in-progress state is preserved. Any subsequent retry using the same `Idempotency-Key` will be blocked with `"Payment is already in progress"` rather than duplicate-executing.
+4. The payment controller catches this error and responds with **HTTP 202 Accepted**:
    ```json
    {
      "message": "payment status could not be confirmed",
@@ -330,7 +428,7 @@ If all 3 commit attempts fail to confirm the commit outcome:
      "transactionId": "TXN-1725330000000-48291"
    }
    ```
-4. This explicitly informs the client application that the payment has been submitted, but the final outcome is pending automated reconciliation or ledger verification. The client must not re-submit a new payment blindly.
+5. This explicitly informs the client application that the payment has been submitted, but the final outcome is pending automated reconciliation or ledger verification. The client must not re-submit a new payment blindly.
 
 ---
 
@@ -351,6 +449,7 @@ backend/
 │   │   ├── Accounts.js           # Financial accounts (USER_WALLET, BANK_SUSPENSE, etc.)
 │   │   ├── Idempotency.js        # Request deduplication and replay protection store
 │   │   ├── LedgerEntry.js        # Immutable double-entry financial records (DEBIT/CREDIT)
+│   │   ├── PaymentIntent.js      # Durable payment intent tracking and idempotency store
 │   │   ├── Session.js            # Stateful sessions with SHA-256 hash & TTL auto-expiry
 │   │   ├── Transaction.js        # High-level business transaction records
 │   │   ├── User.js               # User identity, phone, email, and bcrypt credentials
@@ -384,10 +483,11 @@ backend/
 | **`User`** | `users` | User identity & authentication credentials | `name`, `phone` (unique), `email` (sparse, unique), `hashPswd`, `status` (`ACTIVE`, `BLOCKED`) |
 | **`Account`** | `accounts` | Financial accounting identity | `userId` (ref `User`, null for system accounts), `accountType` (`USER_WALLET`, `BANK_SUSPENSE`, `PLATFORM_REVENUE`, `SETTLEMENT_POOL`), `currency` (`INR`), `status` (`ACTIVE`, `BLOCKED`, `CLOSED`) |
 | **`Wallet`** | `wallets` | Fast mutable balance snapshot | `userId` (unique), `accountId` (ref `Account`, unique), `availableBalance` (integer paise, $\ge 0$) |
+| **`PaymentIntent`** | `paymentintents` | Durable payment request lifecycle & idempotency tracking | `userId` (ref `User`), `senderAccountId` (ref `Account`), `receiverAccountId` (ref `Account`), `amount` (paise, integer $\ge 1$), `currency` (`INR`), `idempotencyKey`, `transactionId` (ref `Transaction`, nullable), `status` (`RECEIVED`, `PROCESSING`, `SUCCESS`, `FAILED`) |
 | **`Transaction`** | `transactions` | Business event record | `transactionId` (unique `TXN-...`), `type` (`P2P_TRANSFER`, `ADD_MONEY`), `senderAccountId` (ref `Account`), `receiverAccountId` (ref `Account`), `amount` (paise), `status` (`INITIATED`, `PROCESSING`, `SUCCESS`, `FAILED`, `REVERSED`), `failureReason` |
 | **`LedgerEntry`** | `ledgerentries` | Double-entry financial audit record | `transactionId` (ref `Transaction`), `accountId` (ref `Account`), `entryType` (`DEBIT`, `CREDIT`), `amount` (paise), `currency` (`INR`) |
 | **`Session`** | `sessions` | Active authenticated device sessions | `userId` (ref `User`), `sessionTokenHash` (unique), `expiresAt` (TTL index), `revokedAt` |
-| **`IdempotencyKey`** | `idempotencykeys`| Request deduplication store | `userId`, `key`, `requestFingerprint`, `status` (`IN_PROGRESS`, `COMPLETED`), `transactionId`, `response`, `expiresAt` (TTL index) |
+| **`IdempotencyKey`** | `idempotencykeys`| General request deduplication store | `userId`, `key`, `requestFingerprint`, `status` (`IN_PROGRESS`, `COMPLETED`), `transactionId`, `response`, `expiresAt` (TTL index) |
 
 ---
 
@@ -584,14 +684,14 @@ Base Path: `/api/payments`
 #### 1. Execute Peer-to-Peer (P2P) Transfer
 `POST /api/payments`
 
-Executes an atomic transfer from the authenticated user's wallet to another user's wallet account using a multi-document MongoDB transaction session with idempotency tracking and commit retry protection.
+Executes an atomic transfer from the authenticated user's wallet to another user's wallet account using a multi-document MongoDB transaction session with durable `PaymentIntent` tracking and commit retry protection.
 
 - **Authentication**: Required (`sessionToken` cookie)
 - **Headers**:
   ```http
   Idempotency-Key: <unique-client-generated-key>
   ```
-  *(Recommended for all payment requests. Used to guarantee exactly-once processing across network retries).*
+  *(Recommended for all payment requests. Used to create and query durable `PaymentIntent` records, guaranteeing exactly-once execution across network retries and client blips).*
 - **Request Body**:
 ```json
 {
@@ -613,9 +713,10 @@ Executes an atomic transfer from the authenticated user's wallet to another user
   }
 }
 ```
+*(Also returned if the client retries an identical request whose `PaymentIntent` has already reached `SUCCESS`).*
 
 - **Response `202 Accepted` (Commit Status Unknown)**:
-Returned when the MongoDB transaction commit attempts encounter `UnknownTransactionCommitResult` and cannot confirm whether the replica set finalized the commit. The transfer may have succeeded; the client must not re-submit the transfer blindly and should query transaction status or await background reconciliation.
+Returned when the MongoDB transaction commit attempts encounter `UnknownTransactionCommitResult` and cannot confirm whether the replica set finalized the commit. The transfer may have succeeded; the `PaymentIntent` remains in `PROCESSING` status. The client must not re-submit the transfer blindly and should query transaction status or await background reconciliation.
 ```json
 {
   "message": "payment status could not be confirmed",
@@ -625,7 +726,7 @@ Returned when the MongoDB transaction commit attempts encounter `UnknownTransact
 ```
 
 - **Error Responses**:
-  - `400 Bad Request`: Validation failure (empty receiver ID, non-integer or negative amount).
+  - `400 Bad Request`: Validation failure (empty receiver ID, non-integer or non-positive amount).
     ```json
     {
       "message": "Invalid input data",
@@ -633,7 +734,7 @@ Returned when the MongoDB transaction commit attempts encounter `UnknownTransact
     }
     ```
   - `401 Unauthorized`: Authentication required or invalid/expired session cookie.
-  - `500 Internal Server Error`: Business logic failure, insufficient funds, self-transfer attempt, payment already in progress, or transaction abort.
+  - `500 Internal Server Error`: Business logic failure, insufficient funds, self-transfer attempt, payment already in progress (`"Payment is already in progress"`), payment already failed (`"Payment has already failed"`), or transaction abort.
     ```json
     {
       "message": "Internal server error"
@@ -679,12 +780,17 @@ Configure the following parameters in `backend/.env`:
    npm install
    ```
 
-3. Start in development mode (with hot-reload via `nodemon`):
+3. Verify JavaScript syntax:
+   ```bash
+   npm run check
+   ```
+
+4. Start in development mode (with hot-reload via `nodemon`):
    ```bash
    npm run dev
    ```
 
-4. Start in production mode:
+5. Start in production mode:
    ```bash
    npm start
    ```
@@ -723,10 +829,11 @@ Payloads are strictly validated using **Zod** schemas before reaching controller
 | :--- | :--- | :--- |
 | **Floating-Point Precision Drift** | Strict integer math in Paise | All balances, amounts, and limits are stored in Paise ($100 = ₹1.00$). Floating-point numbers are prohibited. |
 | **Balance Overdraft / Concurrency Race** | Atomic conditional decrement | `Wallet.updateOne({ _id, availableBalance: { $gte: amount } }, { $inc: { availableBalance: -amount } })`. Prevents negative balances at database level. |
-| **Double-Spending / Duplicate Submission** | Dual-layer idempotency engine | Pre-flight cache lookup + in-transaction insertion into `IdempotencyKey` with unique compound index `{ userId, key }` (catches `E11000`). |
+| **Double-Spending / Duplicate Submission** | Durable PaymentIntent idempotency engine | Pre-flight intent check + out-of-transaction insertion into `PaymentIntent` with compound unique index `{ userId, idempotencyKey }` (catches `E11000`). |
+| **Transaction Abort Visibility / Intent Durability** | Out-of-transaction `PaymentIntent` | Intent record created before ACID session persists regardless of inner transaction abort, rollback, or write conflict. |
 | **Write Conflicts / Primary Election** | Outer transaction retry loop | Retries whole transaction up to 3 times on `TransientTransactionError`, safely aborting and restarting. |
 | **Dropped Commit Network Packets** | Isolated commit retry loop | Retries only `session.commitTransaction()` up to 3 times on `UnknownTransactionCommitResult` without re-executing balance debits. |
-| **Ambiguous Distributed Commit State** | Fail-safe HTTP 202 escalation | Raises `TRANSACTION_COMMIT_UNKNOWN`, preventing blind retries and returning HTTP `202 Accepted` (`status: "UNKNOWN"`). |
+| **Ambiguous Distributed Commit State** | Fail-safe HTTP 202 escalation & persistent intent | Raises `TRANSACTION_COMMIT_UNKNOWN`, preventing blind retries; returns HTTP `202 Accepted` (`status: "UNKNOWN"`) while `PaymentIntent` stays `PROCESSING`. |
 | **Session Theft / Database Leaks** | Hashed stateful sessions | Raw 32-byte tokens are sent via `HttpOnly`, `SameSite=Lax` cookies; only SHA-256 hashes are persisted in MongoDB. |
 | **Arbitrary Balance Inflation** | Double-entry invariant | Money is sourced exclusively from `BANK_SUSPENSE`; every debit is strictly paired with an equal credit in `LedgerEntry`. |
 | **Runaway Account Exposure** | Tiered velocity controls | Per-transaction cap (₹50,000), cumulative daily limit (₹1,00,000), and max wallet balance cap (₹2,00,000). |
@@ -754,6 +861,7 @@ Payloads are strictly validated using **Zod** schemas before reaching controller
    - `users.email`: Sparse unique index.
    - `sessions.sessionTokenHash`: Unique index.
    - `sessions.expiresAt`: Native MongoDB TTL index (`expireAfterSeconds: 0`) for automatic expiration cleanup without background cron workers.
+   - `paymentintents.{userId, idempotencyKey}`: Compound unique index for strict idempotency enforcement and serialized concurrent request handling.
    - `idempotencykeys.{userId, key}`: Compound unique index.
    - `idempotencykeys.expiresAt`: Native MongoDB TTL index (`expireAfterSeconds: 0`) with 24-hour expiration.
    - `transactions.transactionId`: Unique indexed transaction reference.
