@@ -1,1062 +1,848 @@
 # PayFlow Fintech Engine
 
-A production-style UPI-inspired wallet system built with the MERN stack. PayFlow focuses on robust system design, ledger-based accounting, atomic transactions, idempotency, secure session management, and AI-powered financial insights.
+A production-style, UPI-inspired real-time financial wallet and transaction processing engine built with **Node.js**, **Express**, and **MongoDB (Mongoose)**.
 
-> **Note:** This project is designed as a learning-focused fintech backend and is not connected to real banking or payment networks.
+PayFlow demonstrates how modern, mission-critical payment systems handle high concurrency, distributed failures, and strict monetary accounting. The system enforces **ledger-based double-entry bookkeeping**, **multi-document ACID transactions**, **durable out-of-transaction idempotency**, **atomic conditional balance operations**, **two-tier distributed retry loops**, **fail-safe HTTP 202 commit escalation**, and **stateful SHA-256 hashed session security**.
+
+> [!NOTE]
+> **Learning-Focused Production Blueprint:** This repository is an educational, production-grade fintech reference implementation. While it adheres to real-world banking architecture principles, it operates in a simulated environment and is not connected to live external banking networks or NPCI/clearinghouses.
+
+---
+
+## Table of Contents
+
+- [Core Engineering Highlights](#core-engineering-highlights)
+- [Tech Stack](#tech-stack)
+- [Repository Structure](#repository-structure)
+- [Implementation Status](#implementation-status)
+- [Getting Started & Local Setup](#getting-started--local-setup)
+  - [Prerequisites](#prerequisites)
+  - [Environment Configuration](#environment-configuration)
+  - [Installation & Execution](#installation--execution)
+- [API Reference](#api-reference)
+  - [Health Check](#health-check)
+  - [Authentication Endpoints (`/api/auth`)](#authentication-endpoints)
+  - [Wallet Endpoints (`/api/wallet`)](#wallet-endpoints)
+  - [Payment Endpoints (`/api/payments`)](#payment-endpoints)
+- [Financial Accounting Model](#financial-accounting-model)
+  - [Entity Separation Architecture](#entity-separation-architecture)
+  - [Double-Entry Accounting Invariant](#double-entry-accounting-invariant)
+  - [Paise Integer Arithmetic](#paise-integer-arithmetic)
+  - [System Accounts](#system-accounts)
+  - [Velocity Controls & Balance Ceilings](#velocity-controls--balance-ceilings)
+- [Transaction Engine & Concurrency Safety](#transaction-engine--concurrency-safety)
+  - [End-to-End P2P Payment Pipeline](#end-to-end-p2p-payment-pipeline)
+  - [Durable PaymentIntent Pattern & Idempotency](#durable-paymentintent-pattern--idempotency)
+  - [Atomic Conditional Balance Updates](#atomic-conditional-balance-updates)
+  - [Distributed Transaction Resilience (Two-Tier Retries)](#distributed-transaction-resilience-two-tier-retries)
+  - [Unknown Commit State & HTTP 202 Escalation](#unknown-commit-state--http-202-escalation)
+- [Security & Authentication Hardening](#security--authentication-hardening)
+- [Database Models & Indexes](#database-models--indexes)
+- [Validation Rules](#validation-rules)
+- [Extended System Blueprint & Future Roadmap](#extended-system-blueprint--future-roadmap)
+  - [Settlement & Finalization](#settlement--finalization)
+  - [Transactional Outbox & Asynchronous Workers](#transactional-outbox--asynchronous-workers)
+  - [Reconciliation & Discrepancy Auditing](#reconciliation--discrepancy-auditing)
+  - [Webhooks & Callbacks](#webhooks--callbacks)
+  - [Refunds, Reversals & Adjustments](#refunds-reversals--adjustments)
+  - [Financial Invariants & Chaos Testing](#financial-invariants--chaos-testing)
+  - [Deterministic Risk Engine & AI Layer](#deterministic-risk-engine--ai-layer)
+
+---
+
+## Core Engineering Highlights
+
+- **Double-Entry Bookkeeping**: Every transaction generates balanced, immutable debit and credit ledger records ($\sum \text{Debits} = \sum \text{Credits}$). Wallets are mutable balance projections; the immutable ledger is the source of truth.
+- **Strict Integer Arithmetic in Paise**: All balances, transaction amounts, and limits are stored and computed strictly as integers in Paise (1 INR = 100 Paise). Floating-point arithmetic is prohibited to prevent precision drift.
+- **Multi-Document ACID Transactions**: Distributed financial transactions run inside MongoDB replica set sessions (`session.startTransaction()`).
+- **Durable Out-of-Transaction PaymentIntent**: `PaymentIntent` records are created *before and outside* the MongoDB transaction session, ensuring that in-progress request locks, failure tracking, and idempotency records survive transaction rollbacks and write conflicts.
+- **Concurrent Race Serialization**: Compound unique indexing on `{ userId, idempotencyKey }` catches duplicate simultaneous requests via database duplicate key errors (`E11000`), ensuring only one request executes while duplicates safely await or receive existing results.
+- **Zero-Overdraft Atomic Conditional Updates**: Balance deductions use MongoDB conditional atomic operators (`availableBalance: { $gte: amount }` with `$inc: -amount`) to eliminate READ-CHECK-WRITE race conditions and prevent overdrafts under high concurrency.
+- **Two-Tier Distributed Retry Resilience**:
+  - *Outer Loop*: Automatically handles `TransientTransactionError` (write conflicts, replica set elections) up to 3 attempts.
+  - *Inner Commit Loop*: Automatically retries `UnknownTransactionCommitResult` up to 3 times without repeating monetary operations.
+- **Fail-Safe HTTP 202 Escalation**: When commit status remains ambiguous after exhausted commit retries, the system raises `TRANSACTION_COMMIT_UNKNOWN`, preserves the in-flight intent, and returns **HTTP 202 Accepted**, preventing blind retries and double debits.
+- **Stateful SHA-256 Session Security**: HttpOnly, SameSite cookie authentication using cryptographically generated 32-byte session tokens. The database stores strictly SHA-256 hashes, with native MongoDB TTL auto-cleanup after 7 days.
+- **Tiered Financial Velocity Controls**: Hard constraints on single top-ups (₹50,000), cumulative daily top-ups (₹1,00,000), and wallet balance ceilings (₹2,00,000).
+- **Runtime Schema Validation**: Zero-trust request parsing powered by **Zod**.
 
 ---
 
 ## Tech Stack
 
-- **Frontend:** React (Vite), Vanilla CSS, React Query, Axios
-- **Backend:** Node.js, Express.js, MongoDB (Mongoose), Zod, JWT
-- **AI Layer:** Google Gemini API
+### Implemented Backend Core
+- **Runtime & Framework:** Node.js (v18+), Express.js
+- **Database & ODM:** MongoDB (v5+ with Replica Set / MongoDB Atlas), Mongoose
+- **Validation & Security:** Zod, bcrypt, Node.js `crypto` (SHA-256, `randomBytes`)
+- **Transport & Cookies:** `cors`, `cookie-parser`, `dotenv`
+- **Development Tooling:** Nodemon
+
+### Planned Architecture Layers (Roadmap)
+- **Frontend Client:** React (Vite), React Query, Axios, CSS Modules / Vanilla CSS
+- **Asynchronous Processing:** Redis, BullMQ (Transactional Outbox relay & workers)
+- **AI Analytics & Insights:** Google Gemini API
 
 ---
 
-## Core Concepts & Glossary
+## Repository Structure
 
-Here is a glossary of the key financial and technical terms used in the PayFlow engine:
+```text
+PayFlow/
+├── backend/                      # Core Financial & Transaction Engine
+│   ├── src/
+│   │   ├── config/
+│   │   │   └── db.js             # Mongoose connection with MongoDB Replica Set
+│   │   ├── controllers/
+│   │   │   ├── auth.controller.js    # Register, login, and getMe profile handlers
+│   │   │   ├── payment.controller.js # P2P transfer handler with HTTP 202 handling
+│   │   │   └── wallet.controller.js  # Wallet top-up (add-money) HTTP handler
+│   │   ├── middleware/
+│   │   │   └── auth.middleware.js    # SHA-256 session token cookie authenticator
+│   │   ├── models/
+│   │   │   ├── Accounts.js       # Financial accounts (USER_WALLET, BANK_SUSPENSE, etc.)
+│   │   │   ├── Idempotency.js    # Generic request deduplication model
+│   │   │   ├── LedgerEntry.js    # Immutable double-entry financial entries (DEBIT/CREDIT)
+│   │   │   ├── PaymentIntent.js  # Durable out-of-transaction payment tracking & idempotency
+│   │   │   ├── Session.js        # Stateful sessions with SHA-256 hashes & TTL auto-expiry
+│   │   │   ├── Transaction.js    # High-level business event records
+│   │   │   ├── User.js           # User identity, phone, email, and bcrypt credentials
+│   │   │   └── Wallet.js         # Fast mutable balance projection (Paise integer)
+│   │   ├── routes/
+│   │   │   ├── auth.routes.js    # Auth routes mounted at /api/auth
+│   │   │   ├── payment.routes.js # Payment routes mounted at /api/payments
+│   │   │   └── wallet.routes.js  # Wallet routes mounted at /api/wallet
+│   │   ├── services/
+│   │   │   ├── payment.service.js# Resilient P2P pipeline with ACID retries & atomicity
+│   │   │   └── wallet.service.js # Wallet funding service with velocity limit checks
+│   │   ├── utils/                # Utilities and helpers
+│   │   ├── validator/
+│   │   │   ├── addMoney.validator.js # Zod schema for wallet top-up payloads
+│   │   │   ├── auth.validator.js     # Zod schemas for registration and login
+│   │   │   └── payment.validator.js  # Zod schema for P2P payment requests
+│   │   ├── app.js                # Express application configuration and route bindings
+│   │   └── server.js             # Server bootstrap and database connection
+│   ├── .env.example              # Environment variables blueprint
+│   ├── package.json              # Backend dependencies and execution scripts
+│   └── README.md                 # Detailed backend technical documentation
+├── frontend/                     # Client application (Vite / React - in roadmap)
+├── notes.txt                     # Design notes and domain specifications
+└── README.md                     # Main repository documentation (this file)
+```
 
-| Term | Definition |
-| :--- | :--- |
-| **User** | A person using the PayFlow application. |
-| **Account** | The financial identity associated with a user. |
-| **Wallet** | A container showing available money for the user to spend. It is a cached view of money, not the absolute source of truth. |
-| **Available Balance** | The amount of money that can be spent immediately (`Total Balance - Blocked Balance`). |
-| **Blocked Balance** | Balance reserved or held for pending transactions (not spendable). |
-| **Total Balance** | The sum of Available Balance and Blocked Balance (`Available + Blocked`). |
-| **Ledger** | An immutable book of financial entries. Instead of editing history, every change is appended as a new record. |
-| **Ledger Entry** | A single financial movement of type `CREDIT` or `DEBIT`. |
-| **Double-Entry Accounting** | A system where every transaction must affect at least two accounts (a debit for one, a credit for the other) such that total debits equal total credits. |
-| **Transaction** | A business operation representing a physical movement of money between entities. |
-| **Transaction Ref ID** | A unique identifier for tracking and deduplicating a transaction. |
-| **Payment Intent** | An object used to track the payment process from start to finish. Essential for idempotency, retry handling, and payment confirmation flows. Common states: `Initialized`, `Processing`, `Succeeded`, `Failed/Canceled`. |
-| **Transaction State** | The current processing state of a transaction (e.g., `INITIATED`, `VALIDATED`, `AUTHORIZED`, `PROCESSING`, `SUCCESS`, `FAILED`, `EXPIRED`, `REVERSED`). |
-| **Authorization** | The permission required to execute a transaction (e.g., MPIN, device verification, biometric approval). |
-| **Settlement** | The final exchange of money between financial entities (instant for wallets; bank-to-bank settlement is processed later via clearinghouses like NPCI/RBI). |
-| **Reversal** | Undoing a completed transaction by creating a new, opposing transaction (never by deleting the old transaction). |
-| **Atomicity** | The "all-or-nothing" property ensuring either all operations in a transaction succeed, or none do. |
-| **Idempotency** | The property where performing an action multiple times yields the exact same result as doing it once. Managed via an `Idempotency-Key` header. |
-| **Concurrency** | The occurrence of multiple operations or transaction requests happening at the exact same time. |
-| **VPA / UPI-ID** | Virtual Payment Address (e.g., `rohit@payflow`) mapping to an underlying account or wallet. |
-| **PSP (Payment Service Provider)** | The app providing the payment interface (e.g., PayFlow, PhonePe, GooglePay). |
-| **Beneficiary** | The recipient receiving the money in a transaction. |
-| **Aggregation Pipeline** | A sequence of database operations used to process and transform financial data into analytics or insights. |
-| **Running Balance** | The calculated balance of an account after each individual ledger entry, useful for passbook-style audit trails. |
-| **Session** | An object representing an active logged-in device session, facilitating authentication, multi-device tracking, and remote logout capabilities. |
+---
+
+## Implementation Status
+
+| Component / Subsystem | Status | Implementation Details |
+| :--- | :--- | :--- |
+| **User Identity & Auth** |  **Implemented** | Bcrypt password hashing, stateful SHA-256 session tokens, `HttpOnly` cookies, 7-day TTL index, `/api/auth/register`, `/api/auth/login`, `/api/auth/me`. |
+| **Financial Accounting Model** |  **Implemented** | Separation of `User`, `Account`, `Wallet`, and `LedgerEntry`. Support for `USER_WALLET` and system accounts (`BANK_SUSPENSE`, `PLATFORM_REVENUE`, `SETTLEMENT_POOL`). |
+| **Paise Integer Representation** |  **Implemented** | Zero floating-point math; all balances and values stored as integers in Paise ($100 = ₹1.00$). |
+| **Inbound Top-Up (`addMoney`)** |  **Implemented** | Debits `BANK_SUSPENSE`, credits `USER_WALLET`, updates balance snapshot, writes paired ledger entries, enforces ₹50k per-txn, ₹100k daily, and ₹200k balance caps. |
+| **Durable PaymentIntent Idempotency** |  **Implemented** | Out-of-transaction durable record with `{ userId, idempotencyKey }` unique compound index, surviving rollbacks and serializing concurrent races. |
+| **Atomic P2P Money Movement** |  **Implemented** | MongoDB ACID multi-document transactions, atomic conditional debit (`$gte` and `$inc`), balanced credit, paired immutable `DEBIT`/`CREDIT` ledger records. |
+| **Transaction Resilience & Retries** |  **Implemented** | Outer retry loop for `TransientTransactionError` (3x), inner commit-only loop for `UnknownTransactionCommitResult` (3x), HTTP 202 escalation on ambiguous commits. |
+| **Runtime Validation** |  **Implemented** | Zod schemas for registration, login, add-money, and payment requests. |
+| **Frontend UI (React/Vite)** |  *Roadmap* | Dashboard, passbook ledger view, send money modal, QR / VPA lookup. |
+| **Transactional Outbox & Workers** |  *Blueprint* | Event-driven architecture with outbox relay, Redis, and BullMQ queues for settlement and notifications. |
+| **Reconciliation & External Simulator**|  *Blueprint* | External payment network simulator, batch/poll reconciliation, mismatch classification, automated reversal ledger entries. |
+| **Deterministic Risk & Gemini AI** |  *Blueprint* | Deterministic policy evaluation (`ALLOW`, `VERIFY`, `REVIEW`, `REJECT`) + asynchronous Gemini financial insights. |
+
+---
+
+## Getting Started & Local Setup
+
+### Prerequisites
+
+1. **Node.js**: `v18.x` or higher
+2. **npm**: `v9.x` or higher
+3. **MongoDB**: `v5.x` or higher with a **Replica Set** enabled.
+   > [!IMPORTANT]
+   > MongoDB multi-document ACID transactions (`mongoose.startSession()`) require a replica set. If running locally, start `mongod` with `--replSet rs0`. Alternatively, a free cloud database cluster from [MongoDB Atlas](https://www.mongodb.com/atlas) has replica sets enabled out-of-the-box.
+
+### Environment Configuration
+
+Create a `.env` file inside the `backend/` directory by copying `backend/.env.example`:
+
+```bash
+cp backend/.env.example backend/.env
+```
+
+Set the required environment parameters in `backend/.env`:
+
+```env
+PORT=5000
+NODE_ENV=development
+MONGO_URI=mongodb+srv://<username>:<password>@<cluster>.mongodb.net/payflow?retryWrites=true&w=majority
+```
+
+### Installation & Execution
+
+1. **Install backend dependencies:**
+   ```bash
+   cd backend
+   npm install
+   ```
+
+2. **Verify JavaScript syntax:**
+   ```bash
+   npm run check
+   ```
+
+3. **Start in development mode (hot-reload via `nodemon`):**
+   ```bash
+   npm run dev
+   ```
+
+4. **Start in production mode:**
+   ```bash
+   npm start
+   ```
+
+When the server boots successfully, the console will output:
+```text
+database connected successfully
+PayFlow API is running on port 5000
+```
+
+---
+
+## API Reference
+
+### Health Check
+
+#### `GET /`
+Verifies backend service operational health.
+
+- **Request:** No parameters or authentication required.
+- **Response `200 OK`:**
+```json
+{
+  "message": "PayFlow Backend",
+  "status": "running"
+}
+```
+
+---
+
+### Authentication Endpoints
+
+Base Route: `/api/auth`
+
+#### 1. Register User
+`POST /api/auth/register`
+
+Creates a new user identity, automatically provisions a financial account of type `USER_WALLET`, and creates an associated `Wallet` with `0` balance within an atomic MongoDB transaction.
+
+- **Request Body:**
+```json
+{
+  "name": "Rohit Sinha",
+  "phone": "9876543210",
+  "email": "rohit@example.com",
+  "password": "SecurePassword123"
+}
+```
+*Validation Rules: `name` min 2 chars; `phone` exactly 10 digits; `email` valid format (optional); `password` min 6 chars.*
+
+- **Response `201 Created`:**
+```json
+{
+  "message": "User registered successfully",
+  "user": {
+    "id": "64b8f0f4a7c1b2c3d4e5f6a1",
+    "name": "Rohit Sinha",
+    "phone": "9876543210",
+    "email": "rohit@example.com"
+  }
+}
+```
+- **Error Responses:**
+  - `400 Bad Request`: Payload validation failed.
+  - `409 Conflict`: Phone number or email already in use.
+  - `500 Internal Server Error`: Server failure.
+
+---
+
+#### 2. Login User
+`POST /api/auth/login`
+
+Authenticates credentials using `bcrypt.compare`, verifies that account status is `ACTIVE`, generates a cryptographically secure 32-byte session token, stores its SHA-256 hash in MongoDB, and delivers an `HttpOnly` cookie.
+
+- **Request Body:**
+```json
+{
+  "email": "rohit@example.com",
+  "password": "SecurePassword123"
+}
+```
+
+- **Response `200 OK`:**
+  - **Headers:**
+    ```http
+    Set-Cookie: sessionToken=<64-char-hex-token>; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800
+    ```
+  - **Body:**
+    ```json
+    {
+      "message": "login successful",
+      "user": {
+        "id": "64b8f0f4a7c1b2c3d4e5f6a1",
+        "name": "Rohit Sinha",
+        "phone": "9876543210",
+        "email": "rohit@example.com"
+      }
+    }
+    ```
+- **Error Responses:**
+  - `400 Bad Request`: Missing email or password.
+  - `401 Unauthorized`: Invalid credentials.
+  - `403 Forbidden`: User account is `BLOCKED`.
+  - `500 Internal Server Error`: Server error.
+
+---
+
+#### 3. Get Authenticated User Profile
+`GET /api/auth/me`
+
+Resolves the caller's identity via the active `sessionToken` cookie.
+
+- **Authentication:** Required (`sessionToken` cookie).
+- **Response `200 OK`:**
+```json
+{
+  "user": {
+    "id": "64b8f0f4a7c1b2c3d4e5f6a1",
+    "name": "Rohit Sinha",
+    "phone": "9876543210",
+    "email": "rohit@example.com",
+    "status": "ACTIVE"
+  }
+}
+```
+- **Error Responses:**
+  - `401 Unauthorized`: Missing, expired, or invalid session cookie.
+  - `404 Not Found`: User record not found.
+
+---
+
+### Wallet Endpoints
+
+Base Route: `/api/wallet`
+
+#### 1. Add Money / Wallet Top-Up
+`POST /api/wallet/add-money`
+
+Loads funds into the authenticated user's wallet from the platform's external banking clearing account (`BANK_SUSPENSE`).
+
+**Execution & Accounting Lifecycle:**
+1. Resolves caller's `User`, `Account` (`USER_WALLET`), and `Wallet`.
+2. Locates or initializes the platform `BANK_SUSPENSE` account.
+3. Evaluates velocity controls:
+   - Single top-up cap: $\le 5,000,000$ Paise (₹50,000).
+   - Maximum wallet balance ceiling: $\le 20,000,000$ Paise (₹2,00,000).
+   - Daily cumulative top-up limit: $\le 10,000,000$ Paise (₹1,00,000) for the current day.
+4. Generates a `Transaction` record (`type: "ADD_MONEY"`, `status: "INITIATED"`).
+5. Increments `userWallet.availableBalance` by `amount`.
+6. Creates balanced double-entry records:
+   - `DEBIT` on `BANK_SUSPENSE` account for `amount`.
+   - `CREDIT` on caller's `USER_WALLET` account for `amount`.
+7. Transitions `Transaction.status = "SUCCESS"`.
+
+- **Authentication:** Required (`sessionToken` cookie).
+- **Request Body:**
+```json
+{
+  "amount": 500000
+}
+```
+*Note: `amount` must be a positive integer in Paise (`500000` = ₹5,000.00).*
+
+- **Response `201 Created`:**
+```json
+{
+  "message": "Money added successfully",
+  "transaction": {
+    "id": "TXN-1725807600000-84729",
+    "type": "ADD_MONEY",
+    "amount": 500000,
+    "currency": "INR",
+    "status": "SUCCESS"
+  }
+}
+```
+- **Error Responses:**
+  - `400 Bad Request`: Invalid amount format (non-integer or non-positive).
+  - `401 Unauthorized`: Authentication required.
+  - `500 Internal Server Error`: Limit exceeded (`"Transaction amount limit exceeded"`, `"Daily add-money limit exceeded"`, `"Wallet balance limit exceeded"`).
+
+---
+
+### Payment Endpoints
+
+Base Route: `/api/payments`
+
+#### 1. Execute Peer-to-Peer (P2P) Transfer
+`POST /api/payments`
+
+Transfers money atomically between two users' wallet accounts. Utilizes an out-of-transaction durable `PaymentIntent`, MongoDB multi-document ACID isolation, atomic conditional balance decrements, double-entry ledger entries, and two-tier retry resilience.
+
+- **Authentication:** Required (`sessionToken` cookie).
+- **HTTP Headers:**
+  ```http
+  Idempotency-Key: <unique-client-uuid-or-id>
+  ```
+  *(Mandatory in production. Enforces exactly-once execution across network retries and duplicate submits).*
+- **Request Body:**
+```json
+{
+  "receiverAccountId": "64b8f102a7c1b2c3d4e5f6b2",
+  "amount": 50000
+}
+```
+*Note: `amount` must be an integer in Paise (`50000` = ₹500.00). Sender is automatically resolved server-side from the authenticated session; client-supplied sender values are rejected.*
+
+- **Response `200 OK` (Payment Successful):**
+```json
+{
+  "message": "Payment successful",
+  "transaction": {
+    "id": "TXN-1725330000000-48291",
+    "amount": 50000,
+    "currency": "INR",
+    "status": "SUCCESS"
+  }
+}
+```
+*(Also returned if an identical idempotency key is submitted whose payment previously reached `SUCCESS`).*
+
+- **Response `202 Accepted` (Commit Status Ambiguous):**
+Returned when MongoDB commit attempts encounter `UnknownTransactionCommitResult` and cannot confirm whether the replica set finalized the write before network disruption. The `PaymentIntent` remains in `PROCESSING`. The client must not re-execute the transfer blindly.
+```json
+{
+  "message": "payment status could not be confirmed",
+  "status": "UNKNOWN",
+  "transactionId": "TXN-1725330000000-48291"
+}
+```
+
+- **Error Responses:**
+  - `400 Bad Request`: Missing receiver account ID or invalid amount.
+  - `401 Unauthorized`: Authentication required or invalid session.
+  - `500 Internal Server Error`: Business rule failure:
+    - `"Insufficient balance"`
+    - `"Cannot transfer money to your own account"`
+    - `"Payment is already in progress"`
+    - `"Payment has already failed"`
+    - `"Receiver account not found"`
 
 ---
 
 ## Financial Accounting Model
 
-PayFlow separates the **accounting model**, the **immutable ledger**, and the **fast balance view**.
+### Entity Separation Architecture
+
+PayFlow strictly separates human identity, financial accounting entities, fast mutable balance state, durable request intent, and immutable transaction audit logs:
 
 ```text
-                         ACCOUNT
-                            │
-                 ┌──────────┴──────────┐
-                 │                     │
-             LEDGER ENTRIES       BALANCE STATE
-                 │                     │
-          Immutable history          WALLET
-                                    Cached view
+                        USER (Identity & Credentials)
+                                     │
+                                     ▼
+                         ACCOUNT (Financial Entity)
+                       (USER_WALLET, BANK_SUSPENSE,
+                       PLATFORM_REVENUE, SETTLEMENT_POOL)
+                                     │
+          ┌──────────────────────────┼──────────────────────────┐
+          ▼                          ▼                          ▼
+    PAYMENT INTENT            LEDGER ENTRIES             WALLET (Balance)
+  (Durable Intent & Idemp)   (Immutable Ledger)     (Fast Mutable Projection)
+          │                          │
+          └─────────────► TRANSACTION ◄─────────────┘
+                       (Financial Event)
 ```
 
-### Account
+1. **User (`User`)**: Represents the human entity, holds login credentials, phone, and email. Has zero financial balance fields.
+2. **Account (`Account`)**: The accounting identity that participates in financial movements. A user holds an account of type `USER_WALLET`. Platform accounts (`BANK_SUSPENSE`, `PLATFORM_REVENUE`, `SETTLEMENT_POOL`) represent platform holdings and clearinghouses.
+3. **Wallet (`Wallet`)**: A fast, cached view of spendable balance for rapid dashboard loading. **The wallet is a mutable projection, not the financial source of truth.** If wallet state were ever lost or corrupted, it can be recomputed from ledger history.
+4. **PaymentIntent (`PaymentIntent`)**: The durable request state machine (`RECEIVED` → `PROCESSING` → `SUCCESS` / `FAILED`) created outside the financial transaction boundary. Survives rollbacks and anchors idempotency.
+5. **Transaction (`Transaction`)**: Represents a high-level business event (`P2P_TRANSFER`, `ADD_MONEY`) and tracks processing lifecycle (`INITIATED` → `PROCESSING` → `SUCCESS` / `FAILED` / `REVERSED`).
+6. **Ledger Entry (`LedgerEntry`)**: The immutable proof of money movement following double-entry bookkeeping. Every financial event generates paired debit and credit entries.
 
-An `Account` is the accounting identity that participates in financial transactions.
+---
 
-Examples:
+### Double-Entry Accounting Invariant
+
+Every financial movement in PayFlow satisfies the fundamental accounting invariant:
+
+$$\sum \text{Debits} = \sum \text{Credits}$$
+
+#### 1. Inbound Funding (`ADD_MONEY`):
+When a user loads ₹5,000 into their wallet from an external bank:
+- `BANK_SUSPENSE` Account is **DEBITED** by ₹5,000 (`500000` Paise).
+- User's `USER_WALLET` Account is **CREDITED** by ₹5,000 (`500000` Paise).
+- User's `Wallet.availableBalance` increases by `500000` Paise.
 
 ```text
-ROHIT_WALLET_ACCOUNT
-ALICE_WALLET_ACCOUNT
-PLATFORM_REVENUE_ACCOUNT
-BANK_SUSPENSE_ACCOUNT
-SETTLEMENT_POOL_ACCOUNT
+[BANK_SUSPENSE Account] ──(DEBIT ₹5,000)──> [User Account] ──(CREDIT ₹5,000)
+                                                    │
+                                                    ▼
+                                         Wallet Balance += ₹5,000
 ```
 
-### Wallet
+#### 2. Peer-to-Peer Transfer (`P2P_TRANSFER`):
+When Rohit transfers ₹500 to Alice:
+- Rohit's `USER_WALLET` Account is **DEBITED** by ₹500 (`50000` Paise).
+- Alice's `USER_WALLET` Account is **CREDITED** by ₹500 (`50000` Paise).
+- Rohit's `Wallet.availableBalance` decrements by `50000` Paise.
+- Alice's `Wallet.availableBalance` increments by `50000` Paise.
 
-The Wallet is a fast-access representation of current balance state used by the application. It is **not the immutable financial source of truth**.
+```text
+[Rohit's Account] ──(DEBIT ₹500)──> [Alice's Account] ──(CREDIT ₹500)
+       │                                     │
+       ▼                                     ▼
+Rohit Balance -= ₹500               Alice Balance += ₹500
+```
 
-### Ledger
+---
 
-The Ledger is immutable, append-only accounting history. A balance can be rebuilt from ledger history.
+### Paise Integer Arithmetic
+
+> [!IMPORTANT]
+> **No Floating-Point Arithmetic for Money:** Storing fractional currency amounts (e.g., `500.50`) in IEEE 754 floating-point numbers causes precision drift (e.g., `0.1 + 0.2 = 0.30000000000000004`).
+>
+> All amounts, balances, and limits in PayFlow are stored strictly as **integers in Paise** ($1 \text{ INR} = 100 \text{ Paise}$):
+> - ₹1.00 = `100` Paise
+> - ₹500.00 = `50000` Paise
+> - ₹50,000.00 = `5000000` Paise
+
+Mongoose schema validation explicitly enforces integer constraints on all balance and amount fields:
+```javascript
+validate: {
+  validator: Number.isInteger,
+  message: "Amount must be an integer representing paise"
+}
+```
+
+---
 
 ### System Accounts
 
-External money entering or leaving PayFlow is represented through system accounts.
+Money never enters or leaves PayFlow out of thin air. External monetary flows are anchored to platform-level system accounts:
 
-Add Money ₹5,000:
-
-```text
-DEBIT   BANK_SUSPENSE       ₹5,000
-CREDIT  ROHIT_WALLET        ₹5,000
-```
-
-P2P transfer ₹700:
-
-```text
-DEBIT   ROHIT_WALLET        ₹700
-CREDIT  ALICE_WALLET        ₹700
-```
-
-P2P transfer with ₹20 platform fee:
-
-```text
-DEBIT   ROHIT_WALLET        ₹720
-CREDIT  ALICE_WALLET        ₹700
-CREDIT  PLATFORM_REVENUE     ₹20
-```
-
-### Money Representation
-
-PayFlow never stores monetary values as JavaScript floating-point amounts.
-
-All monetary values are stored as **integer minor units**.
-
-For INR:
-
-```text
-₹1       = 100 paise
-₹500     = 50000
-₹500.50  = 50050
-```
-
-Example:
-
-```json
-{
-  "amount": 50050,
-  "currency": "INR"
-}
-```
-
-Conversion to human-readable rupees happens only at the API/UI boundary.
-
-### Wallet Schema
-
-```json
-{
-  "_id": "W1",
-  "userId": "rohit",
-  "accountId": "ACC_ROHIT",
-  "availableBalance": 850000,
-  "updatedAt": "2026-08-14T10:00:00Z"
-}
-```
-
-### Ledger Entry Schema
-
-```json
-{
-  "_id": "L3",
-  "accountId": "ACC_ROHIT",
-  "transactionId": "TXN123",
-  "entryType": "DEBIT",
-  "amount": 50000,
-  "currency": "INR",
-  "createdAt": "2026-08-14T10:00:00Z"
-}
-```
-
-`balanceAfter` is not treated as the accounting source of truth. Passbook-style balances are derived from ledger history or maintained as a read model.
+| System Account Type | Purpose | Financial Role |
+| :--- | :--- | :--- |
+| **`BANK_SUSPENSE`** | Holds external funds in transit before final clearing. | Debited when users add money; credited during bank withdrawals. |
+| **`PLATFORM_REVENUE`**| Platform revenue and service fees. | Credited when transaction fees or merchant interchange are applied. |
+| **`SETTLEMENT_POOL`**  | Inter-bank clearing and partner settlement pool. | Used during end-of-day bank clearing and net settlement cycles. |
 
 ---
 
-## Transaction Lifecycle & Mental Model
+### Velocity Controls & Balance Ceilings
 
-### The Flow
-```
-Transaction Request
-        │
-        ▼
-Creates Ledger Entries (Debit & Credit)
-        │
-        ▼
-Determines Balance Changes
-        │
-        ▼
-Updates Wallet Cached Snapshot
-```
+To defend against rapid balance inflation, fraud, and excessive risk exposure, wallet funding enforces tiered velocity controls:
 
-### Transfer Walkthrough
-Suppose **Rohit** (Wallet `W1`, Balance: ₹10,000) sends **₹500** to **Alice** (Wallet `W2`, Balance: ₹2,000).
+| Limit Policy | Rupee Value | Paise Value | Triggered Exception |
+| :--- | :--- | :--- | :--- |
+| **Max Single Top-Up** | ₹50,000 | `5,000,000` | `"Transaction amount limit exceeded"` |
+| **Cumulative Daily Top-Up** | ₹1,00,000 | `10,000,000` | `"Daily add-money limit exceeded"` |
+| **Max Wallet Balance Cap** | ₹2,00,000 | `20,000,000` | `"Wallet balance limit exceeded"` |
 
-1.  **Create Transaction Record:**
-    ```json
-    {
-      "_id": "TXN123",
-      "fromWallet": "W1",
-      "toWallet": "W2",
-      "amount": 500,
-      "status": "PROCESSING"
-    }
-    ```
-2.  **Generate Double-Entry Ledger Records:**
-    *   **Rohit's Debit Entry:**
-        ```json
-        { "walletId": "W1", "transactionId": "TXN123", "entryType": "DEBIT", "amount": 500 }
-        ```
-    *   **Alice's Credit Entry:**
-        ```json
-        { "walletId": "W2", "transactionId": "TXN123", "entryType": "CREDIT", "amount": 500 }
-        ```
-3.  **Update Wallet Snapshots:**
-    *   `W1` (Rohit) available balance: `10,000 - 500 = 9,500`
-    *   `W2` (Alice) available balance: `2,000 + 500 = 2,500`
+- Daily limits aggregate all successful `ADD_MONEY` records for the user's account between `00:00:00.000` and `23:59:59.999` of the current day.
+- Balance caps assert that `availableBalance + amount <= MAX_WALLET_BALANCE` before initiating the transfer.
 
 ---
 
-## Transaction Fees & Financial Verification
+## Transaction Engine & Concurrency Safety
 
-When a transaction fee is applied (e.g., Rohit pays Alice ₹500, and PayFlow charges Rohit a ₹10 fee):
-- **Rohit's Wallet:** Debited ₹510 (total outgo).
-- **Alice's Wallet:** Credited ₹500 (payment received).
-- **PayFlow Revenue Wallet:** Credited ₹10 (platform fee).
+### End-to-End P2P Payment Pipeline
 
-### Ledger Entries
-*   **Rohit (Sender):** `DEBIT ₹510`
-*   **Alice (Receiver):** `CREDIT ₹500`
-*   **PayFlow Revenue:** `CREDIT ₹10`
-
-### Ledger Validation Rule
-To guarantee system-wide financial integrity, every operation must satisfy:
-$$\text{Total DEBIT} = \text{Total CREDIT}$$
-$$\text{e.g., } 510 \text{ (DEBIT)} = 500 \text{ (CREDIT)} + 10 \text{ (CREDIT)}$$
-
-This assertion check (`totalDebit === totalCredit`) must run and succeed before committing any financial transaction.
-
----
-
-## Supported Payment Types & Categories
-
-PayFlow supports multiple transaction flows, each mapping to a specific real-world business need. While all payment types share the core backend engine (handling authentication, idempotency, state management, ledger entry creation, settlement, and audits), individual transaction flows implement their own distinct business rules.
-
-### Payment Engine Architecture
-```
-                                 PAYMENT ENGINE
-                                       │
-                         ┌─────────────┼─────────────┐
-                         │             │             │
-                        P2P           P2M         COLLECT
-                         │             │             │
-                         ├─────────────┼─────────────┤
-                                       │
-                                    REFUND
-                                       │
-                                    REVERSAL
-                                       │
-                                   ADD MONEY
-                                       │
-                                   WITHDRAWAL
-```
-
-### 1. Payment Categories
-We classify these payment types based on how they route money through the PayFlow ecosystem:
-
-*   **Internal Participant Transfers (Wallet-to-Wallet):**
-    *   **P2P (Person-to-Person):** Standard transfer between two PayFlow users (e.g., Rohit transfers ₹700 to Alice). The flow sequences through:
-        $$\text{Authenticate} \rightarrow \text{Check Limits/Risk} \rightarrow \text{Validate Balance} \rightarrow \text{Reserve Hold} \rightarrow \text{Capture} \rightarrow \text{Double-Entry Ledger} \rightarrow \text{Settlement}$$
-    *   **P2M (Person-to-Merchant):** Initiated when a user purchases from a merchant. This flow maps the destination to a `merchantId` instead of a user ID and supports platform fee rules, customized settlement terms, and merchant account routing.
-*   **Inbound Funding:**
-    *   **Add Money:** Funds enter the PayFlow system from an external funding source (e.g., bank account, credit card) and credit the user's wallet.
-*   **Outbound Liquidation:**
-    *   **Withdrawal:** Funds leave the PayFlow system, debiting the user's wallet and transferring it to their verified external bank account.
-*   **Return Flows:**
-    *   **Refund:** A completed transaction is returned to the sender. Can be full or partial (e.g., returning ₹700 out of a ₹1,000 transaction).
-    *   **Reversal:** Corrects a transaction that failed or timed out during execution. Unlike refunds, reversals are systemic corrections ensuring that funds are not stranded in an invalid state.
-*   **Requested Obligations:**
-    *   **Collect / Payment Request:** A request from a receiver to a sender to authorize a payment. The sender can choose to **Accept** (triggering a P2P/P2M flow) or **Decline** the request.
-
-### 2. Common Foundation for All Payment Flows
-Every transaction, regardless of type, is processed through a shared, standardized pipeline:
-
-```
-          COMMON FOUNDATION
-           Authentication
-                 │
-                 ▼
-             Validation
-                 │
-                 ▼
-            Idempotency
-                 │
-                 ▼
-            Limits / Risk
-                 │
-                 ▼
-         Balance Reservation
-                 │
-                 ▼
-             Transaction
-                 │
-                 ▼
-               Ledger
-                 │
-                 ▼
-             Settlement
-                 │
-                 ▼
-           Reconciliation
-                 │
-                 ▼
-               Audit
+```text
+                     ┌───────────────────────────────┐
+                     │ Client sends Payment Request  │
+                     │ (Header: Idempotency-Key: K)  │
+                     └───────────────┬───────────────┘
+                                     │
+                     [1. Durable Idempotency Check]
+                  PaymentIntent exists for {userId, K}?
+                  ├── Yes:
+                  │   ├── PROCESSING? ──► Has txnId? ──► Return cached Transaction
+                  │   │                               └── Error: "Payment is already in progress"
+                  │   ├── SUCCESS? ──► Return cached Transaction (200 OK)
+                  │   └── FAILED? ──► Error: "Payment has already failed"
+                  └── No: Proceed
+                                     │
+                     [2. Pre-Transaction Resolution]
+                     Resolve Sender (User, Account, Wallet)
+                     Resolve Receiver (Account, Wallet)
+                     Validate Sender Account != Receiver Account
+                                     │
+                  [3. Create Durable PaymentIntent (Outside Session)]
+                     Insert PaymentIntent (status: "PROCESSING")
+                     ├── Duplicate Key (E11000 race)?
+                     │   └── Fetch existing PaymentIntent & resolve status
+                     └── Success ──► Proceed to Transaction Loop
+                                     │
+                                     ▼
+                 ┌───────────────────────────────────────┐
+                 │     Transaction Attempt (Max: 3)      │
+                 │     mongoose.startSession()           │
+                 │     session.startTransaction()        │
+                 └───────────────────┬───────────────────┘
+                                     │
+              1. IDENTIFY ───────────┤ Re-read Sender & Receiver within session (Snapshot Isolation)
+              2. VALIDATE ───────────┤ Re-assert Sender Account != Receiver Account
+              3. CREATE TXN ─────────┤ Insert Transaction (status: "INITIATED")
+              4. LINK INTENT ────────┤ Set paymentIntent.transactionId = txn._id (in session)
+              5. MOVE ───────────────┤ Atomic Conditional Debit (availableBalance >= amount)
+                                     │ Credit Receiver Balance ($inc: amount)
+              6. RECORD ─────────────┤ Insert immutable DEBIT & CREDIT LedgerEntry records
+              7. COMPLETE ───────────┤ Set Transaction status = "SUCCESS"
+                                     │
+                                     ▼
+                 ┌───────────────────────────────────────┐
+                 │         Commit Phase (Max: 3)         │
+                 │       session.commitTransaction()     │
+                 └───────────────────┬───────────────────┘
+                                     │
+              ├── Commit Succeeded ──┴─► [Post-Commit Intent Finalization]
+              │                          Update PaymentIntent (status: "SUCCESS") outside session
+              │                          Return Transaction (200 OK)
+              │
+              ├── UnknownTransactionCommitResult?
+              │   ├── Retry Commit ONLY (commitAttempt < 3)
+              │   └── Attempts Exhausted ──► Throw TRANSACTION_COMMIT_UNKNOWN
+              │                              ├── PaymentIntent remains "PROCESSING"
+              │                              └── Controller returns 202 Accepted
+              │
+              ├── TransientTransactionError during operations?
+              │   └── Abort session & Retry Whole Transaction Loop (attempt < 3)
+              │
+              └── Other Error / Attempts Exhausted?
+                  ├── Abort active transaction session
+                  ├── Update PaymentIntent (status: "FAILED") outside session
+                  └── Throw Error (500)
 ```
 
 ---
 
-## Session Management
+### Durable PaymentIntent Pattern & Idempotency
 
-PayFlow uses **server-side sessions** as the primary authentication mechanism.
+#### Why In-Transaction Idempotency Fails in Distributed Systems
+Traditional systems record idempotency tokens inside the ACID transaction session. This presents a critical flaw:
+- If a transaction aborts (e.g. write conflict, transient network blip, or balance check failure), **the idempotency record rolls back alongside the monetary changes**.
+- The database loses all memory that an attempt occurred.
+- A client retry arrives as a completely fresh request, creating vulnerability to double-spending or untraceable state.
+
+#### The Out-of-Transaction Solution
+PayFlow creates the `PaymentIntent` **outside and before** the MongoDB transaction:
+- The intent document acts as an immutable anchor that survives inner transaction aborts, rollbacks, and failovers.
+- States: `RECEIVED` → `PROCESSING` → `SUCCESS` / `FAILED`.
 
 ```text
-Browser
-   │
-   │ HttpOnly Secure Cookie
-   │ sessionId
-   ▼
-PayFlow API
-   │
-   ▼
-Session Lookup
-   │
-   ▼
-Authenticated User
+PaymentIntent States:
+[RECEIVED] ──► [PROCESSING] ──┬──(Commit Succeeded)──► [SUCCESS]
+                              │
+                              ├──(Non-Retryable Error)──► [FAILED]
+                              │
+                              └──(Commit Unknown)──────► [PROCESSING (Pending Reconciliation)]
 ```
 
-### Session Document
-
-```json
-{
-  "sessionId": "SES_123",
-  "userId": "rohit",
-  "deviceId": "device_9921",
-  "expiresAt": "2026-08-27T10:00:00Z",
-  "revokedAt": null,
-  "createdAt": "2026-08-24T10:00:00Z",
-  "lastUsedAt": "2026-08-24T20:00:00Z"
-}
+#### Concurrency Race Resolution via Compound Unique Index
+The `PaymentIntent` collection enforces a compound unique index:
+```javascript
+paymentIntentSchema.index(
+  { userId: 1, idempotencyKey: 1 },
+  { unique: true }
+);
 ```
-
-### Core Security Features
-
-- Multi-device support.
-- Single-device logout.
-- All-device logout.
-- Immediate server-side session revocation.
-- `HttpOnly`, `Secure`, and appropriate `SameSite` cookie settings.
-- CSRF protection for state-changing cookie-authenticated requests.
-
-JWT access/refresh tokens are treated as an alternative architecture, not a required part of the primary PayFlow implementation.
+When two identical requests arrive simultaneously:
+1. The first request inserts the `PaymentIntent` with status `"PROCESSING"` and claims execution ownership.
+2. The concurrent duplicate request hits MongoDB duplicate key error `E11000`.
+3. The catch block handles `E11000` by querying the winning `PaymentIntent`:
+   - If still `"PROCESSING"`, returns `"Payment is already in progress"`.
+   - If completed (`"SUCCESS"`), fetches and returns the cached `Transaction` immediately.
+   - If failed (`"FAILED"`), returns `"Payment has already failed"`.
 
 ---
 
-## Fintech Authentication & Security
+### Atomic Conditional Balance Updates
 
-To ensure high-grade security, data integrity, and compliance, PayFlow enforces a rigorous authentication and authorization model across both browser sessions and financial API endpoints.
-
-### 1. Multi-Stage Authentication Lifecycle
-* **Initial Login:** The user provides their `Email` and `Password`. The backend validates the credentials against the hashed password stored in the database. Upon success, a secure session is created.
-  $$\text{User Login} \rightarrow \text{Credentials Validated} \rightarrow \text{Session Created}$$
-* **Session vs. JWT:** Instead of standard client-side JWTs, PayFlow employs an HttpOnly cookie-based session verification pattern:
-  ```
-  Browser
-     │
-     │ HttpOnly Session Cookie (Session ID)
-     ▼
-  Access Token / Refresh Token
-     │
-     ▼
-  PayFlow Server
-     │
-     ▼
-  Session Lookup (Database validation)
-  ```
-* **Cookie Protection:** Set as `HttpOnly`, preventing client-side JavaScript from accessing session identifiers directly. To guarantee production-grade security, this should be paired with `Secure` flags (HTTPS only), appropriate `SameSite` policies, and CSRF protection.
-
-### 2. Token Lifecycle & Rotation
-* **Access Tokens:** Short-lived credentials (e.g., 15 minutes) used to access protected financial routes (e.g., `GET /wallet`, `POST /payments`, `GET /transactions`).
-* **Refresh Tokens:** Long-lived credentials stored securely and used solely to acquire new access tokens:
-  $$\text{Refresh Token} \rightarrow \text{Session Validation} \rightarrow \text{New Access Token}$$
-* **Refresh Token Rotation:** Every time a refresh token is used, it is rotated. A new refresh token is issued, and the previous one is revoked. If a revoked token is reused, the engine flags it as a potential token theft and automatically invalidates the entire session.
-  ```
-  Token A (Used) ──► Token B Issued (Token A becomes invalid)
-  ```
-
-### 3. MPIN (Mobile Personal Identification Number)
-For payment authorization, PayFlow implements a secondary security challenge similar to real-world UPI systems:
-* **MPIN Verification:** A 4- or 6-digit PIN used exclusively to authorize money movements, distinct from the account password.
-* **Storage:** Hashed using secure hashing algorithms; never stored in plaintext.
-* **Rate Limiting:** Failed attempts are tracked and rate-limited. Too many consecutive failures trigger a temporary account lock to prevent brute-force attacks.
-  $$\text{Account Authentication (Password)} \rightarrow \text{Payment Authorization (MPIN)}$$
-
-### 4. Transaction Authorization Flow
-Before any money is reserved or transferred, the request goes through multiple validation layers:
-```
-                    Payment Request
-                           │
-                           ▼
-                    Authentication (Session Check)
-                           │
-                           ▼
-                    Authorization (Permission Check)
-                           │
-                           ▼
-                    MPIN Verification
-                           │
-                           ▼
-                    Limits & Risk Engine
-                           │
-                           ▼
-                    Balance & Hold Reservation
-                           │
-                           ▼
-                    Payment Execution
-```
-
-### 5. Financial API Security Principles
-* **Independent Browser Contexts:** Each browser tab or profile maintains its own session, cookies, and authentication state (e.g., Browser A runs User 1, Incognito runs User 2).
-* **Never Trust the Frontend:** The backend must never rely on user identity parameters sent in the request body (e.g., `{ "sender": "rohit", "amount": 500 }`). Instead, the identity must be resolved server-side from the authenticated session.
-* **Security vs. Audit:** Security controls prevent unauthorized actions, while the audit system records all attempts (both successful and blocked) for future compliance and forensics.
-  ```
-  Initiate Request ──► Authentication/MPIN/Limits ──► [Success] ──► Execute Payment
-                               │
-                               └──► [Fail] ──► Reject & Log Audit Event
-  ```
-
----
-
-## Transaction Engine & Execution Lifecycle
-
-The PayFlow transaction pipeline executes sequentially to protect user funds, validate logic, and prevent consistency errors.
-
-```
-[Payment Request] ──► 1. [Limits & Risk checks] ──► 2. [Idempotency Verification] ──► 3. [Balance Hold (Reservation)] ──► 4. [Atomic Execution (with concurrency control)]
-```
-
-### 1. Limits & Risk Engine
-
-Before a transaction enters the ledger or places a balance hold, the engine evaluates whether the payment should be allowed based on business rules and security policies.
-
-```
-                    Payment Request
-                          │
-             ┌────────────┼────────────┐
-             ▼            ▼            ▼
-        Can afford?   Within limits?  Safe?
-             │            │            │
-          Balance       Limits        Risk
-```
-
-*   **Balance Check:** Verifies if the sender has sufficient `Available Balance` (i.e., `Total Balance - Reserved Holds >= Transaction Amount`).
-*   **Limits Engine:** Applies explicit business checks:
-    *   *Per-Transaction Limits:* Maximum limit of ₹20,000 per payment.
-    *   *Daily Accumulative Limits:* Maximum daily limit of ₹50,000. If a user has already sent ₹45,000, attempting a new ₹10,000 transfer is rejected with `LIMIT_EXCEEDED` (since $45,000 + 10,000 = \text{₹55,000}$).
-    *   *Velocity/Frequency Limits:* E.g., a maximum of 5 payments allowed in a rolling 10-minute window to prevent spam or automated abuse.
-*   **Risk Engine:** Evaluates transaction risk profiles and outputs a policy decision:
-    *   `ALLOW`: Proceed with the transaction.
-    *   `VERIFY`: Trigger step-up authentication (e.g., MPIN verification or biometric approval).
-    *   `REVIEW`: Route to admin review queue.
-    *   `REJECT`: Block the transaction.
-
-### 2. Idempotency Engine
-
-Idempotency protects against duplicate financial operations caused by double-clicks, client retries, network retries, or uncertain server responses.
-
-```text
-Idempotency
-= the same request has one financial effect
-
-Concurrency control
-= different simultaneous requests remain financially correct
-```
-
-### Idempotency Record
-
-Each operation stores:
-
-```text
-userId
-idempotencyKey
-requestFingerprint
-status
-transactionId
-response
-createdAt
-expiresAt
-```
-
-The combination of `(userId, idempotencyKey)` is protected by a unique database constraint.
-
-### Lifecycle
-
-```text
-Request
-   │
-   ▼
-Create Idempotency Record
-   │
-   ├── New
-   │     ↓
-   │   IN_PROGRESS
-   │     ↓
-   │   Execute payment
-   │     ↓
-   │   COMPLETED
-   │
-   └── Existing
-         │
-         ├── IN_PROGRESS → return processing response
-         └── COMPLETED → return original response
-```
-
-A reused key with a different request fingerprint is rejected.
-
-### 3. Balance Reservations (Holds)
-
-Reservations are first-class database entities rather than only a numeric blocked-balance field.
-
-A reservation protects funds while an external operation is unresolved.
-
-### Reservation Document
-
-```json
-{
-  "reservationId": "RES123",
-  "accountId": "ACC_ROHIT",
-  "transactionId": "TXN123",
-  "amount": 70000,
-  "currency": "INR",
-  "status": "ACTIVE",
-  "expiresAt": "2026-08-24T21:00:00Z"
-}
-```
-
-### Reservation Lifecycle
-
-```text
-ACTIVE
-  ├── CAPTURED
-  ├── RELEASED
-  └── EXPIRED
-```
-
-- `ACTIVE`: funds are protected.
-- `CAPTURED`: the hold becomes part of the completed operation.
-- `RELEASED`: the hold is removed because the operation did not commit.
-- `EXPIRED`: the timeout window elapsed; expiry does not automatically imply failure if the external outcome is uncertain.
-
-If total balance is ₹2,000 and active reservations total ₹1,500:
-
-```text
-Available Balance = ₹2,000 - ₹1,500 = ₹500
-```
-
-### 4. Atomicity & Failure Recovery
-
-All balance updates and ledger entries for a single payment must be handled as one **Atomic Unit**. If any individual step fails (e.g., receiver's account is suspended, or system goes offline mid-operation), the entire set of changes must roll back automatically, leaving the balances untouched.
-
-```
-                  PAYMENT
-                     │
-           ┌─────────┴─────────┐
-           │                   │
-        Sender              Receiver
-        - ₹500               + ₹500
-           │                   │
-           └─────────┬─────────┘
-                     │
-               ONE ATOMIC UNIT
-```
-
-We implement this in Node.js/Mongoose using MongoDB Sessions:
+PayFlow prevents the classic READ-CHECK-WRITE double-spend race condition by utilizing **atomic conditional database updates**:
 
 ```javascript
-const mongoose = require('mongoose');
-
-const session = await mongoose.startSession();
-try {
-  await session.withTransaction(async () => {
-    // 1. Debit sender's wallet snapshot (with balance check)
-    // 2. Credit receiver's wallet snapshot
-    // 3. Create debit/credit ledger entries
-    // 4. Update the main Transaction/Payment Intent status to 'SUCCESS'
-  });
-} catch (error) {
-  // Transaction is automatically rolled back if any error is thrown
-  console.error("Transaction aborted:", error);
-} finally {
-  await session.endSession();
-}
-```
-
-### 5. Concurrency, Race Conditions & Mitigation
-
-#### The Double-Spend / Overdraft Problem
-When multiple transactions execute at the exact same time, a race condition can occur if they read the same initial state before writing their updates:
-
-```
-Time   Request A (Send ₹80)               Request B (Send ₹50)
- │     (User Wallet Balance: ₹100)        (User Wallet Balance: ₹100)
- │
- ├────► Reads Balance (₹100)
- │                                        Reads Balance (₹100) ◄────┤
- ├────► Validates: ₹100 >= ₹80 (OK)
- │                                        Validates: ₹100 >= ₹50 (OK) ◄┤
- ├────► Calculates: 100 - 80 = ₹20
- │                                        Calculates: 100 - 50 = ₹50 ◄─┤
- ├────► Writes Balance: ₹20
- │                                        Writes Balance: ₹50 ◄─────┤ (Overwrites A's write!)
- ▼
-```
-In this scenario, the user successfully sent ₹130, but their wallet balance ends up at ₹50 (or ₹20 if Request A wrote last). The system has allowed an overdraft and lost money.
-
-#### Mitigations
-
-##### A. Atomic Database Updates (Failsafe Condition)
-Instead of reading the balance into application memory, verifying it, and saving it, run atomic update operations directly in the database using conditional queries.
-*   **Vulnerable (Anti-pattern):**
-    ```javascript
-    const wallet = await Wallet.findById(id);
-    if (wallet.availableBalance >= amount) {
-      wallet.availableBalance -= amount;
-      await wallet.save();
-    }
-    ```
-*   **Secure (Atomic):**
-    ```javascript
-    const res = await Wallet.updateOne(
-      { _id: id, availableBalance: { $gte: amount } },
-      { $inc: { availableBalance: -amount } },
-      { session }
-    );
-    if (res.modifiedCount === 0) {
-      throw new Error("Insufficient funds or wallet inactive");
-    }
-    ```
-    This ensures that the balance check (`$gte: amount`) and decrement (`$inc`) happen in a single, thread-safe database action.
-
-##### B. Optimistic Concurrency Control (OCC)
-For complex updates that cannot be easily done with a simple `$inc`, use version keys. Each document contains a version field (`version` or `__v`). When writing back, the database verifies that the version has not changed since it was read.
-```javascript
-const wallet = await Wallet.findOne({ userId });
-const currentVersion = wallet.version;
-
-// Perform complex operations...
-const updatedBalance = wallet.availableBalance - amount;
-
-const res = await Wallet.updateOne(
-  { _id: wallet._id, version: currentVersion },
-  { availableBalance: updatedBalance, $inc: { version: 1 } },
+// ATOMIC DEBIT: Balance check and decrement in a single database operation
+const senderDebit = await Wallet.updateOne(
+  {
+    _id: senderWallet._id,
+    availableBalance: { $gte: amount }
+  },
+  {
+    $inc: { availableBalance: -amount }
+  },
   { session }
 );
 
-if (res.modifiedCount === 0) {
-  throw new Error("Concurrency conflict: document modified by another process. Please retry.");
+if (senderDebit.modifiedCount === 0) {
+  throw new Error("Insufficient balance");
 }
 ```
 
-##### C. Distributed/Pessimistic Locking
-In distributed systems or high-concurrency environments, transactions on the same wallet resource can be serialized using locking mechanisms.
-*   **Redis Locks (Redlock):** A lock is acquired on the resource key `lock:wallet:<walletId>` before processing the transaction. Any parallel request trying to acquire the same lock will block or fail fast, preventing database-level contention entirely.
-
-### 6. Payment Lifecycle & State Machine
-
-Payments in PayFlow transition through a series of states to handle delays, retries, and failures gracefully:
-
-```text
- [INITIATED] ──► [PROCESSING] ──┬──► [SUCCESS]
-                                 ├──► [FAILED]
-                                 └──► [EXPIRED] ──► [REVERSED] (if debited)
-```
-
-#### State Definitions
-
-*   **INITIATED:** The user has requested a payment. The payment intent is created, but no money has moved yet.
-*   **PROCESSING:** The system is waiting for network/bank confirmations, or processing database modifications.
-*   **SUCCESS:** The payment completed successfully. Balances are updated and ledger entries are locked.
-*   **FAILED:** Something went wrong (e.g., network error, insufficient funds). No money is moved.
-*   **REVERSED:** Undoing a completed transaction. A new transaction is created to credit the sender and debit the receiver.
-*   **EXPIRED:** The payment request remained unresolved in `PROCESSING` for too long.
-    *   *Note:* `EXPIRED` does not automatically return money. It indicates timeout. If funds were debited during `PROCESSING` before timeout, the system must trigger a `REVERSED` state to return the funds.
-
-### State Transition Enforcement
-
-Transaction states are enforced through an explicit transition table.
-
-```text
-INITIATED
-   │
-   ▼
-VALIDATED
-   │
-   ▼
-AUTHORIZED
-   │
-   ▼
-PROCESSING
-   ├── SUCCESS
-   ├── FAILED
-   ├── EXPIRED
-   └── INVESTIGATING
-
-SUCCESS
-   │
-   └── REVERSED
-```
-
-Examples of illegal transitions:
-
-```text
-SUCCESS  → INITIATED      ❌
-FAILED   → SUCCESS        ❌
-REVERSED → SUCCESS        ❌
-```
-
-A transition validates the current state, destination state, actor/source, and business conditions.
-
-### 7. Timeout Handling & Uncertain Outcomes (TIMEOUT)
-
-A timeout during processing represents an uncertain transaction outcome. When an external network fails to respond within a given window (e.g., 10 seconds), the engine must **never assume failure**. Assuming failure and immediately releasing funds can lead to double-spending or overdrafts if the transaction eventually succeeds on the external network.
-
-#### The Mental Model
-```
-            TIMEOUT
-               │
-               ▼
-      Don't assume failure
-               │
-               ▼
-     Keep money protected
-               │
-               ▼
-     Find out what happened
-```
-
-#### Walkthrough of a Timeout Scenario
-Suppose **Rohit** has a total balance of **₹1,000** and initiates a payment of **₹700**:
-1. **Reservation:** The system reserves ₹700.
-   - `Total Balance` = ₹1,000, `Reserved` = ₹700, `Available Balance` = ₹300.
-2. **External Call:** PayFlow sends transaction `PAY123` for ₹700 to the external system.
-3. **No Response:** After 10 seconds, the connection times out.
-4. **Transition to Uncertain State:** Conceptually, `PAY123` is marked as `PROCESSING` or `UNKNOWN` (not `FAILED`). The reserved ₹700 remains blocked.
-
-#### Resolution Mechanisms
-To discover the actual state of the transaction, the engine employs two primary mechanisms:
-
-*   **Querying the External System (Direct Status API):**
-    The system queries the external provider's status endpoint: *"What is the status of PAY123?"*.
-    - **If SUCCESS:** The reservation is transitioned to `CAPTURE` and a `DEBIT` ledger entry is made. Rohit's final available balance is ₹300.
-    - **If FAILED:** The reservation is transitioned to `RELEASE`. Rohit's ₹700 hold is freed, making his available balance ₹1,000.
-*   **Reconciliation (Delayed Audits):**
-    If the external provider does not support real-time status queries or is down, the system waits for the external network's transaction records to arrive (e.g., end-of-day batch files). The reconciliation worker compares the local `PROCESSING`/`TIMEOUT` record with the external record:
-    - **Mismatch Found:** PayFlow sees `TIMEOUT`, External sees `SUCCESS` for ₹700.
-    - **Resolution:** The engine executes the correction flow to finalize the state.
-
-#### Unresolved/Investigating State
-If the transaction state still cannot be determined after querying and reconciliation:
-- The payment intent transitions to an `INVESTIGATING` status (e.g., `PAY123` status = `INVESTIGATING`).
-- The reserved funds remain protected and locked in accordance with business risk policy until manual verification or final reconciliation settles the dispute.
-
-### 8. Reconciliation & Discrepancy Auditing
-
-Reconciliation is the process of comparing our internal system records (the database and immutable ledger) with another external source of truth to ensure consistency and correctness.
-
-```
-             RECONCILIATION
-                   │
-                   ▼
-          Compare two records
-                   │
-          ┌────────┴────────┐
-          ▼                 ▼
-       MATCH            MISMATCH
-          │                 │
-        Done         Investigate/Resolve
-                            │
-                  ┌─────────┼─────────┐
-                  ▼         ▼         ▼
-               Update    Reverse    Manual
-               state     money      review
-```
-
-#### The Concept
-*   **Match:** When both records agree. E.g., PayFlow logs `PAY123` as `SUCCESS` for ₹500, and the external payment network logs `PAY123` as `SUCCESS` for ₹500.
-*   **Mismatch:** When status, amount, or details differ. E.g., PayFlow logs `PAY123` as `SUCCESS` for ₹500, but the external network logs it as `SUCCESS` for ₹450 (Amount Mismatch) or logs it as `FAILED` (Status Mismatch).
-
-#### Handling Mismatches
-When a discrepancy is detected, the reconciliation system flags it for resolution based on the scenario:
-
-| Scenario | Local Status | External Status | Action |
-| :--- | :--- | :--- | :--- |
-| **Scenario A** | `PROCESSING` | `SUCCESS` | Update local transaction state: `PROCESSING` → `SUCCESS` and execute ledger balance changes. |
-| **Scenario B** | `SUCCESS` | `FAILED` | Investigate the root cause (e.g., timeout handling error) and perform a new **Reversal** / refund transaction to return the money. |
-| **Scenario C** | Any | Mismatched Amount | Halt automatic processing, flag the transaction, and route it to **Manual review**. |
-
-#### Project Implementation (External Simulator)
-To simulate this process, PayFlow compares its database with an isolated external simulated payment network:
-
-```
-┌──────────────────────┐
-│       PayFlow        │
-│    Local Database    │
-└──────────┬───────────┘
-           │
-           │ Payment Request
-           ▼
-┌──────────────────────┐
-│ Fake Payment Network │
-│  External Simulator  │
-└──────────────────────┘
-```
-
-The fake network maintains its own records independent of our local system. Our reconciliation service pulls these records, checks for inconsistencies, and runs discrepancy logic:
-
-```
-             PAY123
-                │
-        ┌───────┴───────┐
-        ▼               ▼
-     PayFlow        External
-     SUCCESS         FAILED
-        │               │
-        └───────┬───────┘
-                ▼
-            MISMATCH -> Trigger Reversal & Alerts
-```
-
-#### Reconciliation vs. Resolution
-
-While **Reconciliation** is the analytical phase (detecting and classifying mismatches), **Resolution** is the operational phase (applying corrections to the ledger to fix those mismatches).
-
-```
-                External System
-                      │
-                      │ Reconciliation Data
-                      ▼
-              ┌─────────────────┐
-              │ Reconciliation  │
-              │     Engine      │
-              └────────┬────────┘
-                       │
-                 Compare Records
-                       │
-          ┌────────────┴────────────┐
-          │                         │
-       MATCH                    MISMATCH
-          │                         │
-      No Action               Classify Issue
-                                    │
-                           ┌────────┴────────┐
-                           │                 │
-                       Fee Difference    Actual Issue
-                           │                 │
-                       No Correction      Investigate
-                                             │
-                                      Resolution Decision
-                                             │
-                                  ┌──────────┴─────────┐
-                                  │                    │
-                              Reversal             Adjustment
-                                  │                    │
-                                  └────────┬───────────┘
-                                           │
-                                      New Ledger Entry
-```
-
-*   **Fee Difference:** A common mismatch is a discrepancy due to varying transaction/network fees. Often, no balance correction is needed.
-*   **Actual Issue:** A structural failure or processing discrepancy that requires investigation. The system makes a resolution decision (e.g., automated Reversal or manual Adjustment) and appends a **new ledger entry** to correct the balance.
+- MongoDB verifies `availableBalance >= amount` and decrements `availableBalance` in a single atomic write.
+- If balance is insufficient, `modifiedCount === 0` and the transaction aborts immediately.
+- **Overdrafts and negative balances are mathematically impossible at the database engine level.**
 
 ---
 
-## Settlement & Finalization (SETTLEMENT)
+### Distributed Transaction Resilience (Two-Tier Retries)
 
-Settlement is the process by which financial obligations between transacting parties are finalized and actual money is transferred between their respective financial institutions.
+Distributed replica sets can experience transient network partitions or write conflicts under load. PayFlow implements a two-tier retry strategy:
+
+#### 1. Whole-Transaction Retries (`TransientTransactionError`)
+- Governed by `MAX_ATTEMPTS = 3`.
+- Catches MongoDB errors with the label `TransientTransactionError` (write conflicts, replica set elections).
+- Aborts the failed session cleanly, acquires a fresh session, and restarts the transaction pipeline.
+
+#### 2. Commit-Only Retries (`UnknownTransactionCommitResult`)
+- Governed by `MAX_COMMIT_ATTEMPTS = 3`.
+- Catches MongoDB errors with label `UnknownTransactionCommitResult`. This occurs when the commit message was sent, but the driver could not confirm whether the replica set finished committing before connection loss.
+- **Fintech Principle**: In this scenario, **only the commit is retried**. The balance movements and ledger entries are **never repeated**, strictly preventing duplicate debits.
+
+---
+
+### Unknown Commit State & HTTP 202 Escalation
+
+If all 3 commit attempts fail to confirm the outcome:
+1. The service tags the error with metadata:
+   ```javascript
+   err.code = "TRANSACTION_COMMIT_UNKNOWN";
+   err.transactionId = createdTransaction.transactionId;
+   err.idempotencyKey = idempotencyKey;
+   ```
+2. The outer retry loop recognizes `err.code === "TRANSACTION_COMMIT_UNKNOWN"` and intentionally avoids re-executing the transaction.
+3. The `PaymentIntent` intentionally remains in `status: "PROCESSING"`. Any subsequent retry with the same key is blocked with `"Payment is already in progress"`.
+4. The payment controller catches this error and returns **HTTP 202 Accepted**:
+   ```json
+   {
+     "message": "payment status could not be confirmed",
+     "status": "UNKNOWN",
+     "transactionId": "TXN-1725330000000-48291"
+   }
+   ```
+5. This informs the client application that the payment was accepted, but the final outcome is pending verification. The client must not re-submit a new payment blindly.
+
+---
+
+## Security & Authentication Hardening
+
+Rather than stateless JWTs (which cannot be revoked instantly without distributed blacklists and are vulnerable when stored in localStorage), PayFlow uses a **stateful, hashed session-cookie pattern**:
+
+```text
+Client (Browser)                       Backend API                          MongoDB
+      │                                     │                                  │
+      │─── POST /api/auth/login ───────────>│                                  │
+      │    { email, password }              │─── Verify password (bcrypt) ────>│
+      │                                     │─── Generate 32-byte raw token ───│
+      │                                     │─── Compute SHA-256 hash ─────────│
+      │                                     │─── Store { userId, hash } ──────>│ (TTL: 7 days)
+      │<── Set-Cookie: sessionToken ────────│                                  │
+      │    (HttpOnly, SameSite=Lax)         │                                  │
+      │                                     │                                  │
+      │─── Request with Cookie ────────────>│                                  │
+      │                                     │─── Hash cookie token (SHA-256) ──│
+      │                                     │─── Look up session document ────>│
+      │                                     │─── Attach req.userId ────────────│
+      │<── Processed Response ──────────────│                                  │
+```
+
+- **Cryptographic Token Generation**: 64-character hex token generated via `crypto.randomBytes(32)`.
+- **Hashed Storage**: MongoDB stores only the **SHA-256 hash** (`sessionTokenHash`). Even if the database is leaked, valid session tokens cannot be derived.
+- **Cookie Flags**: Delivered with `HttpOnly: true` (blocking client-side JavaScript access) and `SameSite: "lax"`.
+- **Automatic TTL Expiry**: Sessions expire after 7 days via a native MongoDB TTL index on `expiresAt`.
+- **Zero-Trust Identity**: Senders are resolved strictly server-side from `req.userId` attached by `authMiddleware`. Request body sender parameters are never trusted.
+
+---
+
+## Database Models & Indexes
+
+### Schema Models Summary
+
+| Model | Collection | Primary Responsibility | Key Attributes |
+| :--- | :--- | :--- | :--- |
+| **`User`** | `users` | Human identity & login credentials | `name`, `phone` (unique), `email` (sparse, unique), `hashPswd`, `status` (`ACTIVE`, `BLOCKED`) |
+| **`Account`** | `accounts` | Financial accounting identity | `userId` (ref `User`, null for system), `accountType` (`USER_WALLET`, `BANK_SUSPENSE`, `PLATFORM_REVENUE`, `SETTLEMENT_POOL`), `currency`, `status` |
+| **`Wallet`** | `wallets` | Fast mutable balance projection | `userId` (unique), `accountId` (ref `Account`, unique), `availableBalance` (integer Paise, $\ge 0$) |
+| **`PaymentIntent`** | `paymentintents` | Durable request state & idempotency | `userId`, `senderAccountId`, `receiverAccountId`, `amount` (Paise), `currency`, `idempotencyKey`, `transactionId`, `status` (`RECEIVED`, `PROCESSING`, `SUCCESS`, `FAILED`) |
+| **`Transaction`** | `transactions` | Business event record | `transactionId` (unique), `type` (`P2P_TRANSFER`, `ADD_MONEY`), `senderAccountId`, `receiverAccountId`, `amount`, `status` (`INITIATED`, `PROCESSING`, `SUCCESS`, `FAILED`, `REVERSED`) |
+| **`LedgerEntry`** | `ledgerentries` | Immutable double-entry financial record | `transactionId` (ref `Transaction`), `accountId` (ref `Account`), `entryType` (`DEBIT`, `CREDIT`), `amount` (Paise), `currency` |
+| **`Session`** | `sessions` | Active authenticated device session | `userId` (ref `User`), `sessionTokenHash` (unique), `expiresAt` (TTL), `revokedAt` |
+| **`IdempotencyKey`** | `idempotencykeys`| Request deduplication store | `userId`, `key`, `requestFingerprint`, `status` (`IN_PROGRESS`, `COMPLETED`), `transactionId`, `response`, `expiresAt` (TTL) |
+
+### Database Index Specifications
+
+```javascript
+// User uniqueness
+users.phone: { unique: true }
+users.email: { unique: true, sparse: true }
+
+// Session security & automated cleanup
+sessions.sessionTokenHash: { unique: true }
+sessions.expiresAt: { expireAfterSeconds: 0 }  // Native MongoDB TTL cleanup
+
+// Durable Idempotency
+paymentintents.{ userId: 1, idempotencyKey: 1 }: { unique: true }
+idempotencykeys.{ userId: 1, key: 1 }: { unique: true }
+idempotencykeys.expiresAt: { expireAfterSeconds: 0 }
+
+// Financial Audit & Query Performance
+transactions.transactionId: { unique: true }
+ledgerentries.transactionId: { index: true }
+ledgerentries.accountId: { index: true }
+```
+
+---
+
+## Validation Rules
+
+Incoming requests are strictly validated using **Zod** before executing business logic:
+
+| Schema | File | Field | Validation Rules | Error Message |
+| :--- | :--- | :--- | :--- | :--- |
+| `registerSchema` | `validator/auth.validator.js` | `name` | String, trimmed, min 2 characters | `"Name must contain at least 2 characters"` |
+| `registerSchema` | `validator/auth.validator.js` | `phone` | String, 10-digit regex (`^\d{10}$`) | `"Phone must be a valid 10-digit number"` |
+| `registerSchema` | `validator/auth.validator.js` | `email` | Optional, trimmed, valid email format | `"Invalid email address"` |
+| `registerSchema` | `validator/auth.validator.js` | `password` | String, min 6 characters | `"Password must contain at least 6 characters"` |
+| `loginSchema` | `validator/auth.validator.js` | `email` | String, trimmed, valid email format | `"Invalid email address"` |
+| `loginSchema` | `validator/auth.validator.js` | `password` | String, min 1 character | `"Password is required"` |
+| `addMoneySchema` | `validator/addMoney.validator.js` | `amount` | Number, integer, strictly positive ($> 0$) | `"Number must be positive"`, `"amount must be greater than 0"` |
+| `paymentSchema` | `validator/payment.validator.js` | `receiverAccountId` | String, non-empty | `"reciever account ID is required"` |
+| `paymentSchema` | `validator/payment.validator.js` | `amount` | Number, integer, strictly positive ($> 0$) | `"amount must be an integer"`, `"amount must be greater than 0"` |
+
+---
+
+## Extended System Blueprint & Future Roadmap
+
+The following sections define the architectural blueprint for upcoming phases of the PayFlow platform.
+
+### Settlement & Finalization
+
+Settlement is the process where financial obligations between transacting entities are cleared.
 
 > [!IMPORTANT]
-> **Key Principle:** Payment success is distinct from settlement completeness:
-> $$\text{PAYMENT SUCCESS} \neq \text{SETTLEMENT COMPLETE}$$
-> A successful payment signifies that the transaction has been authorized and captured locally. Settlement signifies that the underlying funds have physically shifted between banking networks.
-
-### The Flow
-```
-Payment Instruction
-        │
-        ▼
-     SUCCESS (Local authorization & record)
-        │
-        ▼
-Financial Obligations Created
-        │
-        ▼
-    SETTLEMENT (Obligation finalized)
-```
-
-### Settlement States
-To track this background process, settlements progress through their own lifecycle states:
-*   `PENDING`: The obligation is recorded but not yet cleared.
-*   `SETTLED`: The external bank or clearing system confirmed final clearing.
-*   `FAILED`: Settlement failed (requires rollback, reversal, or manual intervention).
-*   `INVESTIGATING`: Stuck in verification or requiring manual audit.
-
-```
-PENDING
-   │
-   ├── SETTLED
-   │
-   ├── FAILED
-   │
-   └── INVESTIGATING
-```
-
-### Ensuring Settlement Completion
-In production systems, settlement finalization is guaranteed using several layers:
-1. **Settlement Records:** Explicitly tracking unsettled obligations as separate entities in the database.
-2. **Background Workers:** Asynchronous worker queues that pull pending settlements and process them against external networks/clearers.
-3. **Retries:** Standardizing automated retries for temporary bank downtime (`PENDING` $\rightarrow$ `Retry` $\rightarrow$ `SETTLED`).
-4. **Monitoring & Alerts:** Paging engineers if a record remains `PENDING` for longer than a predefined window (e.g., $X$ minutes).
-5. **Reconciliation:** Running audits to verify local database settlement states against the external clearer's daily transaction settlement logs.
-
-### Project Implementation Model
-To simulate settlement in PayFlow, payments and settlements are kept as separate concepts:
-*   **Payment Event:** `PAY123` is marked `SUCCESS` when authorized.
-*   **Settlement Event:** A settlement record is initialized as `PENDING`.
-*   **Clearance Simulator:** A settlement background worker runs, transitions `PENDING` to `SETTLED` or `FAILED`, and the reconciliation engine compares PayFlow's records with a simulated external settlement database.
-
----
-
-## Audit Trails & Logging System
-
-Audit logs record the exact history of events, state changes, and actors surrounding a financial transaction. They serve as the "CCTV" of the system.
-
-### Actors in the System
-Audit events are created by distinct actors to ensure clear accountability:
-*   `USER`: The person initiating the action (e.g., Rohit sending money).
-*   `ADMIN`: A platform administrator investigating or overriding an issue.
-*   `API`: Automated system components responding to incoming webhooks.
-*   `PAYMENT_WORKER`: The worker queue executing transfers and state commitments.
-*   `RECONCILIATION_WORKER`: The worker identifying inconsistencies and triggers.
-*   `SYSTEM`: Core scheduler or fallback automation daemon.
-
-#### Example Event Object
-```json
-{
-  "timestamp": "2026-08-16T10:05:01Z",
-  "actorType": "SYSTEM",
-  "actorId": "reconciliation-worker",
-  "event": "RECONCILIATION_MISMATCH",
-  "details": { "transactionId": "PAY123", "mismatchType": "AMOUNT_MISMATCH" }
-}
-```
-
-### Timeline of a Discrepancy
-```
-10:00:01 ──► [USER / rohit] Payment initiated (PAYMENT_INITIATED)
-10:00:02 ──► [USER / rohit] MPIN verified (MPIN_VERIFIED)
-10:00:03 ──► [SYSTEM / payment-worker] Wallet debit completed (DEBIT_COMPLETED)
-10:00:03 ──► [SYSTEM / payment-worker] Transaction marked SUCCESS (PAYMENT_SUCCESS)
-10:05:00 ──► [SYSTEM / reconciliation-worker] Reconciliation started (RECONCILIATION_STARTED)
-10:05:01 ──► [SYSTEM / reconciliation-worker] Amount mismatch detected (MISMATCH_DETECTED)
-10:10:42 ──► [ADMIN / admin123] Investigation completed (DISCREPANCY_REVIEWED)
-10:10:43 ──► [SYSTEM / payment-worker] Reversal created (REVERSAL_CREATED)
-```
-
----
-
-## The Three Layers of PayFlow
-
-Every payment operation in the PayFlow engine is tracked across three independent but connected layers:
-
-```
-                PAYMENT
-                   │
-       ┌───────────┼────────────┐
-       │           │            │
-       ▼           ▼            ▼
-   Transaction    Ledger      Audit
-       │           │            │
-   Business      Money        History
-    State        Movement      of Actions
-```
-
-1.  **Transaction Layer (Business State):** Stores the current business story and user-facing status of the payment intent (e.g., `PAY123`, amount: ₹500, status: `SUCCESS`).
-2.  **Ledger Layer (Money Movement):** The immutable accounting book. Every movement is recorded as double-entry ledger items (e.g., Rohit: `DEBIT ₹500`, Alice: `CREDIT ₹500`).
-3.  **Audit Layer (History of Actions):** The step-by-step security record of everything that occurred (e.g., `PAYMENT_INITIATED`, `MPIN_VERIFIED`, `RECONCILIATION_STARTED`, `MISMATCH_DETECTED`, `REVERSAL_CREATED`).
-
-**Fintech Core Principle:** Never rewrite history to make the present look correct. If an error occurs or a correction is needed, always write a new record (ledger/audit log) explaining what happened, preserving the historical timeline.
-
----
-
-## MongoDB Aggregation Pipelines
-
-In fintech architectures, loading dashboards, generating passbooks, and analyzing transaction volume require aggregating massive amounts of data efficiently. PayFlow utilizes MongoDB Aggregation Pipelines to process, transform, and compute metrics directly inside the database engine.
-
-### Why Use Aggregation Pipelines?
-Instead of fetching thousands of raw records into the application memory and processing them in Node.js (which consumes significant bandwidth and CPU), aggregation pipelines process data in stages before returning only the final, computed result.
-
-### Conceptual Pipeline
-An aggregation pipeline passes documents through a sequence of stages:
-```text
-  Transactions (Raw Documents)
-               │
-               ▼
-           $match (Filter by status/date)
-               │
-               ▼
-           $group (Group by sender/receiver)
-               │
-               ▼
-           Calculate (Sum, count, average)
-               │
-               ▼
-           $sort (Sort by total volume)
-               │
-               ▼
-            Result (Aggregated Analytics)
-```
-
-#### Example Scenario
-Suppose the database has the following transactions:
-* `PAY001` → ₹500
-* `PAY002` → ₹700
-* `PAY003` → ₹200
-* `PAY004` → ₹1,000
-
-To calculate the total transaction volume, the aggregation pipeline sums these values inside the database, returning a single result: `₹2,400`.
-
-### Key Aggregation Stages Used in PayFlow
-1. **`$match`:** Filters documents to pass only those matching specified conditions (e.g., status is `SUCCESS`, or timestamp is within the current day).
-2. **`$group`:** Groups input documents by a specified identifier (e.g., grouping transactions by `userId`) and computes accumulated values (such as `$sum` for total spent or `$avg` for average transaction amount).
-3. **`$sum`:** Calculates the cumulative mathematical sum of numeric values.
-4. **`$count`:** Counts the number of documents in a stage (e.g., counting failed vs. successful transactions).
-5. **`$sort`:** Sorts the resulting documents by a specific field (e.g., sorting users descending by their total transaction volume).
-6. **`$limit`:** Restricts the number of output documents (e.g., fetching only the top 10 users).
-
----
-
-## Event-Driven Architecture, Transactional Outbox & Workers
-
-PayFlow uses asynchronous processing for work that does not need to block the user's critical payment decision.
-
-### Why a Transactional Outbox?
-
-Financial database changes and event publication cannot be treated as two unrelated writes.
-
-Unsafe:
+> **Fintech Principle:** $\text{PAYMENT SUCCESS} \neq \text{SETTLEMENT COMPLETE}$
+> A successful wallet transaction signifies instant local authorization. Inter-bank settlement operates asynchronously through clearinghouses (e.g. NPCI, RBI, or central settlement pools).
 
 ```text
-MongoDB Transaction
-        │
-        ├── Commit payment
-        └── Publish to Redis
+Payment Instruction ──► Local SUCCESS ──► Settlement Record (PENDING) ──► Clearing Worker ──► SETTLED
 ```
 
-If the process crashes after the database commits but before Redis receives the event, the payment succeeds but background processing is never triggered.
+- **Settlement States:** `PENDING` → `SETTLED` / `FAILED` / `INVESTIGATING`.
+- **Settlement Pool Account:** Uses `SETTLEMENT_POOL` system accounts to track pooled bank liabilities during multi-party batch settlement.
 
-### Correct Architecture
+---
+
+### Transactional Outbox & Asynchronous Workers
+
+To prevent distributed data inconsistencies between MongoDB commits and message queue publications, PayFlow is designed around the **Transactional Outbox Pattern**:
 
 ```text
                      Payment Engine
@@ -1083,317 +869,84 @@ If the process crashes after the database commits but before Redis receives the 
           Worker                       Worker               Worker
 ```
 
-The transaction, ledger changes, reservation changes, and outbox event commit atomically.
-
-The relay publishes committed outbox events to BullMQ and safely retries publication.
-
-### Outbox Event
-
-```json
-{
-  "eventId": "EVT123",
-  "eventType": "PAYMENT_SUCCEEDED",
-  "aggregateType": "PAYMENT",
-  "aggregateId": "TXN123",
-  "correlationId": "CORR_8f31",
-  "payload": {
-    "transactionId": "TXN123"
-  },
-  "publishedAt": null,
-  "createdAt": "2026-08-24T20:00:00Z"
-}
-```
-
-### Hybrid Execution Path
-
-1. **Synchronous path:** authenticate, validate, authorize, check limits/risk, create the transaction, reserve funds, and commit the immediate financial state.
-2. **Outbox path:** persist events atomically with the transaction.
-3. **Relay path:** publish committed outbox events to BullMQ.
-4. **Worker path:** perform settlement, reconciliation, notification, reporting, and other asynchronous tasks.
-
-### Worker Idempotency
-
-Workers must tolerate at-least-once execution.
-
-```text
-Worker receives SETTLE_TXN123
-          │
-          ▼
-Already terminal?
-      │          │
-     YES         NO
-      │          │
-      ▼          ▼
-   No-op       Process
-```
-
-Workers:
-
-1. Identify the business operation uniquely.
-2. Check current state.
-3. Perform the operation only if it has not completed.
-4. Commit state changes atomically.
-5. Retry transient failures.
-6. Route permanently failing jobs to a dead-letter/review path.
-
-### Correlation IDs
-
-A correlation ID is propagated through:
-
-```text
-HTTP Request
-    ↓
-Transaction
-    ↓
-Outbox Event
-    ↓
-Queue Job
-    ↓
-Worker
-    ↓
-External Simulator
-    ↓
-Webhook
-    ↓
-Audit Event
-```
-
-This allows one payment journey to be reconstructed end-to-end.
-
-### Major Asynchronous Components
-
-#### Settlement
-
-```text
-PAYMENT_SUCCEEDED
-       ↓
-Outbox Event
-       ↓
-Settlement Queue
-       ↓
-Settlement Worker
-       ↓
-External Simulator
-       ↓
-SETTLED / FAILED / INVESTIGATING
-```
-
-#### Reconciliation
-
-The Reconciliation Worker compares PayFlow records with the external simulator and classifies mismatches.
-
-#### Notification
-
-Notifications are isolated from financial processing. Provider failure does not roll back a successful payment.
-
-#### Analytics & Risk
-
-Additional workers can consume events for analytics, fraud analysis, reporting, and AI-assisted explanations without modifying core payment logic.
-
-### Technology Stack
-
-```text
-Node.js / Express API
-        │
-        ▼
-     MongoDB
-        │
-        ▼
- Transactional Outbox
-        │
-        ▼
-   Outbox Relay
-        │
-        ▼
- Redis + BullMQ
-        │
-        ├── Settlement Queue
-        ├── Reconciliation Queue
-        ├── Notification Queue
-        └── Risk / Reporting Queue
-```
-
-### Failure Scenarios
-
-- Database commit succeeds but relay crashes.
-- Relay publishes and crashes before marking the outbox event published.
-- Worker receives the same job more than once.
-- Worker crashes after the external operation succeeds.
-- Duplicate webhook arrives.
-- Webhook arrives out of order.
-- External status remains unknown.
-- Reconciliation discovers an amount mismatch.
-
-The architecture handles these through retries, idempotent no-ops, investigation, or explicit corrective transactions rather than duplicate money movement.
+1. **Transactional Outbox**: Outbox event records are saved within the same MongoDB transaction as the financial ledger entries.
+2. **Outbox Relay**: Reads committed outbox records and publishes them to Redis-backed **BullMQ** job queues.
+3. **Worker Idempotency**: Workers check transaction state prior to executing actions, tolerating at-least-once message delivery safely.
 
 ---
 
-## External Callbacks / Webhooks
+### Reconciliation & Discrepancy Auditing
 
-The external simulator communicates through callbacks as well as status polling.
-
-PayFlow must safely handle:
-
-- Duplicate callbacks.
-- Delayed callbacks.
-- Out-of-order callbacks.
-- Invalid signatures.
-- Callbacks for terminal transactions.
-- Callbacks arriving after reconciliation.
+Reconciliation audits internal ledger balances against external banking network records:
 
 ```text
-External Simulator
-       │
-       ▼
-POST /webhooks/payment
-       │
-       ▼
-Verify Signature
-       │
-       ▼
-Find Transaction
-       │
-       ▼
-Validate State Transition
-       │
-       ▼
-Apply Idempotently
+                External Bank / Network
+                           │
+                           │ Batch Settlement File
+                           ▼
+                 Reconciliation Engine
+                           │
+                     Compare Records
+                           │
+              ┌────────────┴────────────┐
+              ▼                         ▼
+            MATCH                    MISMATCH
+              │                         │
+          No Action              Classify & Resolve
+                                        │
+                               ┌────────┴────────┐
+                               ▼                 ▼
+                            Reversal         Adjustment
+                               │                 │
+                               └────────┬────────┘
+                                        ▼
+                             New Corrective Ledger
 ```
 
-A duplicate callback must create at most one financial effect.
+- **Match**: PayFlow and external network agree on status and amount.
+- **Mismatch Types**:
+  - `STATUS_MISMATCH` (e.g. Local `PROCESSING`, External `SUCCESS`).
+  - `AMOUNT_MISMATCH` (e.g. Fee discrepancy or partial deduction).
+- **Resolution**: Errors are corrected by appending **new double-entry ledger entries**, never by modifying historical records.
 
 ---
 
-## Refunds, Reversals & Adjustments
+### Webhooks & Callbacks
 
-Corrections never rewrite historical ledger entries. They create new transactions and ledger entries.
-
-### Parent Transaction Linkage
+External banking simulators notify PayFlow of transaction progress via signed webhook callbacks:
 
 ```text
-Original TXN100
-₹1,000
-    │
-    ├── Refund TXN101 → ₹400
-    └── Refund TXN102 → ₹600
+External Gateway ──► POST /webhooks/payment ──► Verify HMAC Signature ──► Check State Machine ──► Apply Idempotently
 ```
 
-Total refunded cannot exceed the original amount.
-
-Rules:
-
-- A refund cannot exceed the original transaction amount.
-- A refund cannot refund another refund.
-- A reversal references the transaction it corrects.
-- Historical ledger entries remain immutable.
-- Corrections create new double-entry ledger movements.
-- Reconciliation adjustments are explicitly classified and audited.
+- Defends against duplicate webhooks, delayed callbacks, and out-of-order events.
+- Idempotent handler guarantees that duplicate webhooks cause at most one financial effect.
 
 ---
 
-## Financial Invariants & Correctness Checks
+### Refunds, Reversals & Adjustments
 
-PayFlow periodically verifies properties that must always remain true.
-
-### Double-Entry Invariant
-
-```text
-Total Debits = Total Credits
-```
-
-### System-Wide Invariant
-
-```text
-Total Debits = Total Credits
-```
-
-### Reservation Invariant
-
-Active reservations must not exceed the account's controlled balance.
-
-### Refund Invariant
-
-Cumulative refunds must never exceed the original transaction amount.
-
-### State Invariant
-
-Terminal transactions cannot move to unrelated states.
-
-Invariant checks run as background jobs and are also used in concurrency and failure tests.
+Corrections strictly preserve historical ledger immutability:
+- **Refunds**: Triggered when a completed transaction is returned to the payer (full or partial). Cumulative refunds cannot exceed the original payment amount.
+- **Reversals**: Systemic corrections when a transaction timed out or failed mid-stream, returning held funds to the sender.
+- **Rule**: Every refund or reversal creates a brand-new `Transaction` and paired `LedgerEntry` records referencing the original `transactionId`.
 
 ---
 
-## Correctness & Chaos Testing
+### Financial Invariants & Chaos Testing
 
-The project intentionally tests failure modes, not only happy paths.
+Automated testing and continuous invariant checkers verify the following non-negotiable rules:
 
-### Concurrent Transfers
-
-Assert:
-
-```text
-No negative spendable balance
-No lost ledger movement
-Debit = Credit
-Only permitted payments succeed
-```
-
-### Idempotency Storm
-
-Send many simultaneous requests with the same user, idempotency key, and request body.
-
-Assert:
-
-```text
-Exactly one financial operation
-```
-
-### Duplicate Webhooks
-
-Send:
-
-```text
-SUCCESS
-SUCCESS
-SUCCESS
-```
-
-Assert:
-
-```text
-One financial effect
-```
-
-### Out-of-Order Webhooks
-
-Send:
-
-```text
-FAILED
-SUCCESS
-```
-
-Assert that the explicit state machine rejects or safely handles the invalid transition.
-
-### Worker Crash
-
-Simulate a committed financial transaction, committed outbox event, worker crash, and retry.
-
-Assert eventual processing without duplicate financial effects.
-
-### Accounting Invariant
-
-After each scenario:
-
-```text
-Total Debit = Total Credit
-```
+1. **Double-Entry Invariant**: $\sum \text{DEBIT} = \sum \text{CREDIT}$ across every individual transaction and across the entire platform.
+2. **Non-Negative Balance Invariant**: `availableBalance >= 0` for all user wallets at all times.
+3. **Idempotency Invariant**: 100 simultaneous duplicate payment requests must produce exactly 1 financial ledger debit and credit.
+4. **Race Condition Invariant**: 10 simultaneous transfers of ₹100 from an account holding ₹100 must result in exactly 1 success and 9 rejections.
 
 ---
 
-## Risk Engine & AI Layer
+### Deterministic Risk Engine & AI Layer
 
-The financial decision engine remains deterministic.
+Risk evaluation and automated financial insights operate as decoupled layers:
 
 ```text
 Payment Request
@@ -1401,100 +954,23 @@ Payment Request
       ▼
 Deterministic Risk Engine
       │
-      ├── ALLOW
-      ├── VERIFY
-      ├── REVIEW
-      └── REJECT
+      ├── ALLOW  ──► Proceed to atomic payment
+      ├── VERIFY ──► Challenge with MPIN / OTP
+      ├── REVIEW ──► Route to manual review queue
+      └── REJECT ──► Decline immediately
       │
       ▼
-Async AI Layer
+Async AI Layer (Google Gemini)
       │
       ▼
-Explanation / Investigation / Reporting
+Natural Language Passbook Summaries & Anomaly Explanations
 ```
 
-AI must not directly mutate balances or bypass deterministic financial controls.
+- **Deterministic Core**: Balances and transfers are governed strictly by deterministic code and hard limits.
+- **AI Layer**: Consumes immutable transaction and ledger data asynchronously to generate spending analytics, explain flagged anomalies, and provide natural language passbook summaries without direct mutation privileges.
 
 ---
 
-## Recommended Implementation Sequence
+## License
 
-The implementation follows the dependency order below:
-
-```text
-1.  Project Foundation
-        ↓
-2.  Authentication & Sessions
-        ↓
-3.  User / Account / Wallet Model
-        ↓
-4.  Money Representation & Financial Invariants
-        ↓
-5.  Ledger & Double-Entry Accounting
-        ↓
-6.  Transaction / Payment Intent State Machine
-        ↓
-7.  Idempotency
-        ↓
-8.  Reservations / Holds
-        ↓
-9.  Atomic Transactions
-        ↓
-10. Concurrency Control
-        ↓
-11. Payment Flows
-        ↓
-12. External Payment Simulator
-        ↓
-13. Timeout & Uncertain Outcomes
-        ↓
-14. Webhooks / Callbacks
-        ↓
-15. Settlement
-        ↓
-16. Transactional Outbox
-        ↓
-17. Redis / BullMQ / Workers
-        ↓
-18. Worker Idempotency & Retries
-        ↓
-19. Reconciliation
-        ↓
-20. Refunds / Reversals / Adjustments
-        ↓
-21. Audit Trails & Correlation IDs
-        ↓
-22. Invariant Checker
-        ↓
-23. MongoDB Aggregations / Analytics
-        ↓
-24. Risk Engine
-        ↓
-25. Correctness & Chaos Testing
-        ↓
-26. AI Layer
-```
-
-### Why this order?
-
-- Accounting must exist before payment flows.
-- State transitions must exist before timeout/retry handling.
-- Reservations and concurrency control must exist before realistic parallel payments.
-- The external simulator must exist before uncertain outcomes, settlement, and reconciliation can be exercised.
-- The outbox must exist before relying on reliable asynchronous workers.
-- Worker idempotency must exist before relying on retries.
-- Reconciliation depends on PayFlow records and an external source of truth.
-- AI comes last because it consumes already-correct financial data; it does not establish financial correctness.
-
-### Non-Negotiable Invariants
-
-1. Money is stored in integer minor units.
-2. Ledger entries are immutable.
-3. Every financial transaction is double-entry balanced.
-4. Duplicate requests cannot create duplicate financial effects.
-5. Concurrent requests cannot create an overdraft.
-6. Reservations protect unresolved funds.
-7. Invalid state transitions are rejected.
-8. Corrections create new ledger entries.
-9. Async workers are safe to retry.
-10. Reconciliation never rewrites historical records.
+This project is licensed under the MIT License.
