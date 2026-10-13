@@ -42,6 +42,11 @@ const paymentIntentSchema = new mongoose.Schema(
             required: true,
         },
 
+        requestFingerprint: {
+            type: String,
+            default: null,
+        },
+
         transactionId: {
             type: mongoose.Schema.Types.ObjectId,
             ref: "Transaction",

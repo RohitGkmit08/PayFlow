@@ -1,4 +1,5 @@
 const mongoose = require("mongoose");
+const crypto = require("node:crypto");
 
 const User = require("../models/User.js");
 const Account = require("../models/Accounts.js");
@@ -7,778 +8,590 @@ const Transaction = require("../models/Transaction.js");
 const LedgerEntry = require("../models/LedgerEntry.js");
 const PaymentIntent = require("../models/PaymentIntent.js");
 
-// IDENTIFY → VALIDATE → CREATE → MOVE → RECORD → COMPLETE
+const MAX_TRANSACTION_ATTEMPTS = 3;
+const MAX_COMMIT_ATTEMPTS = 3;
 
+// Create errors with codes that the controller can interpret.
+function createServiceError(message, code, statusCode = 500) {
+  const error = new Error(message);
+  error.code = code;
+  error.statusCode = statusCode;
+  return error;
+}
+
+// Bind an idempotency key to the original payment details.
+function createRequestFingerprint({
+  senderAccountId,
+  receiverAccountId,
+  amount,
+  currency,
+}) {
+  const canonicalRequest = JSON.stringify({
+    senderAccountId: String(senderAccountId),
+    receiverAccountId: String(receiverAccountId),
+    amount,
+    currency,
+  });
+
+  return crypto
+    .createHash("sha256")
+    .update(canonicalRequest)
+    .digest("hex");
+}
+
+function isDuplicateKeyError(error) {
+  return error?.code === 11000;
+}
+
+function hasErrorLabel(error, label) {
+  return (
+    typeof error?.hasErrorLabel === "function" &&
+    error.hasErrorLabel(label)
+  );
+}
+
+// Check whether this request has already been processed.
+async function findExistingIntent({
+  userId,
+  idempotencyKey,
+  receiverAccountId,
+  amount,
+  requestFingerprint,
+}) {
+  const intent = await PaymentIntent.findOne({
+    userId,
+    idempotencyKey,
+  });
+
+  if (!intent) return null;
+
+  // A key cannot be reused for different payment details.
+  if (
+    String(intent.receiverAccountId) !== String(receiverAccountId) ||
+    intent.amount !== amount
+  ) {
+    throw createServiceError(
+      "Idempotency-Key was already used with different payment details",
+      "IDEMPOTENCY_KEY_REUSED",
+      409
+    );
+  }
+
+  if (
+    requestFingerprint &&
+    intent.requestFingerprint &&
+    intent.requestFingerprint !== requestFingerprint
+  ) {
+    throw createServiceError(
+      "Idempotency-Key was already used with different payment details",
+      "IDEMPOTENCY_KEY_REUSED",
+      409
+    );
+  }
+
+  if (intent.status === "SUCCESS") {
+    const transaction = intent.transactionId
+      ? await Transaction.findById(intent.transactionId)
+      : null;
+
+    if (!transaction) {
+      throw createServiceError(
+        "PaymentIntent points to a missing transaction",
+        "PAYMENT_RECORD_INCONSISTENT",
+        500
+      );
+    }
+
+    return { intent, transaction };
+  }
+
+  if (intent.status === "FAILED") {
+    throw createServiceError(
+      "This payment request has already failed",
+      "PAYMENT_ALREADY_FAILED",
+      409
+    );
+  }
+
+  if (
+    intent.status === "PROCESSING" ||
+    intent.status === "RECEIVED"
+  ) {
+    const transaction = intent.transactionId
+      ? await Transaction.findById(intent.transactionId)
+      : null;
+
+    if (transaction?.status === "SUCCESS") {
+      return { intent, transaction };
+    }
+
+    throw createServiceError(
+      "Payment is still processing or its outcome is unresolved",
+      "PAYMENT_PROCESSING",
+      202
+    );
+  }
+
+  throw createServiceError(
+    "Unknown payment intent status",
+    "INVALID_PAYMENT_INTENT_STATUS",
+    500
+  );
+}
+
+// Identify the sender and receiver accounts and their wallets.
+async function identifyAccounts({
+  senderUserId,
+  receiverAccountId,
+  session,
+}) {
+  const senderUserQuery = User.findById(senderUserId);
+
+  if (session) senderUserQuery.session(session);
+
+  const senderUser = await senderUserQuery;
+
+  if (!senderUser || senderUser.status !== "ACTIVE") {
+    throw createServiceError(
+      "Sender user not found or inactive",
+      "SENDER_NOT_ACTIVE",
+      400
+    );
+  }
+
+  const senderAccountQuery = Account.findOne({
+    userId: senderUser._id,
+    accountType: "USER_WALLET",
+    status: "ACTIVE",
+  });
+
+  if (session) senderAccountQuery.session(session);
+
+  const senderAccount = await senderAccountQuery;
+
+  if (!senderAccount) {
+    throw createServiceError(
+      "Sender account not found or inactive",
+      "SENDER_ACCOUNT_NOT_FOUND",
+      400
+    );
+  }
+
+  const senderWalletQuery = Wallet.findOne({
+    userId: senderUser._id,
+    accountId: senderAccount._id,
+  });
+
+  if (session) senderWalletQuery.session(session);
+
+  const senderWallet = await senderWalletQuery;
+
+  if (!senderWallet) {
+    throw createServiceError(
+      "Sender wallet not found",
+      "SENDER_WALLET_NOT_FOUND",
+      400
+    );
+  }
+
+  const receiverAccountQuery = Account.findOne({
+    _id: receiverAccountId,
+    accountType: "USER_WALLET",
+    status: "ACTIVE",
+  });
+
+  if (session) receiverAccountQuery.session(session);
+
+  const receiverAccount = await receiverAccountQuery;
+
+  if (!receiverAccount) {
+    throw createServiceError(
+      "Receiver account not found or inactive",
+      "RECEIVER_ACCOUNT_NOT_FOUND",
+      400
+    );
+  }
+
+  const receiverWalletQuery = Wallet.findOne({
+    accountId: receiverAccount._id,
+    userId: receiverAccount.userId,
+  });
+
+  if (session) receiverWalletQuery.session(session);
+
+  const receiverWallet = await receiverWalletQuery;
+
+  if (!receiverWallet) {
+    throw createServiceError(
+      "Receiver wallet not found",
+      "RECEIVER_WALLET_NOT_FOUND",
+      400
+    );
+  }
+
+  if (senderAccount._id.equals(receiverAccount._id)) {
+    throw createServiceError(
+      "Cannot transfer money to your own account",
+      "SELF_TRANSFER",
+      400
+    );
+  }
+
+  return {
+    senderUser,
+    senderAccount,
+    senderWallet,
+    receiverAccount,
+    receiverWallet,
+  };
+}
+
+// Call only when we know the financial transaction did not commit.
+async function markIntentFailedIfSafe(intentId) {
+  try {
+    await PaymentIntent.updateOne(
+      {
+        _id: intentId,
+        status: { $in: ["RECEIVED", "PROCESSING"] },
+      },
+      {
+        $set: { status: "FAILED" },
+      }
+    );
+  } catch (error) {
+    // Preserve the original error.
+    // A reconciliation process can repair the intent status later.
+  }
+}
 const createP2P = async ({
-    senderUserId,
+  senderUserId,
+  receiverAccountId,
+  amount,
+  idempotencyKey,
+}) => {
+  if (!senderUserId) {
+    throw createServiceError(
+      "Authenticated sender is required",
+      "SENDER_REQUIRED",
+      401
+    );
+  }
+
+  if (
+    !idempotencyKey ||
+    typeof idempotencyKey !== "string"
+  ) {
+    throw createServiceError(
+      "Idempotency-Key is required",
+      "IDEMPOTENCY_KEY_REQUIRED",
+      400
+    );
+  }
+
+  if (!Number.isSafeInteger(amount) || amount <= 0) {
+    throw createServiceError(
+      "Amount must be a positive safe integer representing paise",
+      "INVALID_AMOUNT",
+      400
+    );
+  }
+
+  // First, check whether this request has already been processed.
+  const existing = await findExistingIntent({
+    userId: senderUserId,
+    idempotencyKey,
     receiverAccountId,
     amount,
-    idempotencyKey
-}) => {
+  });
 
-    /*
-     * IDEMPOTENCY CHECK
-     *
-     * PaymentIntent is the durable record for the payment request.
-     *
-     * Unlike the financial transaction, PaymentIntent is created
-     * outside the MongoDB transaction so that it survives if the
-     * financial transaction is rolled back.
-     */
+  if (existing) return existing.transaction;
 
-    const existingPaymentIntent = await PaymentIntent.findOne({
-        userId: senderUserId,
-        idempotencyKey
+  const initialAccounts = await identifyAccounts({
+    senderUserId,
+    receiverAccountId,
+  });
+
+  const requestFingerprint = createRequestFingerprint({
+    senderAccountId: initialAccounts.senderAccount._id,
+    receiverAccountId: initialAccounts.receiverAccount._id,
+    amount,
+    currency: "INR",
+  });
+
+  // Create the intent outside the financial transaction so the request
+  // record can survive a financial transaction rollback.
+  let paymentIntent;
+
+  try {
+    paymentIntent = await PaymentIntent.create({
+      userId: senderUserId,
+      senderAccountId: initialAccounts.senderAccount._id,
+      receiverAccountId: initialAccounts.receiverAccount._id,
+      amount,
+      currency: "INR",
+      idempotencyKey,
+      requestFingerprint,
+      status: "PROCESSING",
+    });
+  } catch (error) {
+    if (!isDuplicateKeyError(error)) throw error;
+
+    // Another request may have created the intent concurrently.
+    const winner = await findExistingIntent({
+      userId: senderUserId,
+      idempotencyKey,
+      receiverAccountId,
+      amount,
+      requestFingerprint,
     });
 
-    if (existingPaymentIntent) {
-
-        /*
-         * The same payment request has already been seen.
-         *
-         * SUCCESS → return the existing transaction.
-         *
-         * PROCESSING → do not execute the payment again.
-         *
-         * FAILED → return the same failed result.
-         */
-
-        if (existingPaymentIntent.status === "PROCESSING") {
-
-            const existingTransaction =
-                existingPaymentIntent.transactionId
-                    ? await Transaction.findById(
-                        existingPaymentIntent.transactionId
-                    )
-                    : null;
-
-            if (existingTransaction) {
-                return existingTransaction;
-            }
-
-            throw new Error("Payment is already in progress");
-        }
-
-        if (existingPaymentIntent.status === "SUCCESS") {
-
-            const existingTransaction =
-                await Transaction.findById(
-                    existingPaymentIntent.transactionId
-                );
-
-            if (!existingTransaction) {
-                throw new Error(
-                    "PaymentIntent points to a missing transaction"
-                );
-            }
-
-            return existingTransaction;
-        }
-
-        if (existingPaymentIntent.status === "FAILED") {
-            throw new Error("Payment has already failed");
-        }
-
-        throw new Error("Unknown payment intent status");
-    }
-
-
-    /*
-     * IDENTIFY
-     *
-     * Identify the sender and receiver before creating the
-     * durable PaymentIntent.
-     *
-     * senderUserId comes from authentication middleware.
-     * The client does not choose the sender.
-     */
-
-    const senderUser = await User.findById(senderUserId);
-
-    if (!senderUser) {
-        throw new Error("No such user found");
-    }
-
-
-    const senderAccount = await Account.findOne({
-        userId: senderUser._id,
-        accountType: "USER_WALLET",
-        status: "ACTIVE"
-    });
-
-    if (!senderAccount) {
-        throw new Error("Sender account not found");
-    }
-
-
-    const senderWallet = await Wallet.findOne({
-        userId: senderUser._id,
-        accountId: senderAccount._id
-    });
-
-    if (!senderWallet) {
-        throw new Error("Sender wallet not found");
-    }
-
-
-    const receiverAccount = await Account.findOne({
-        _id: receiverAccountId,
-        accountType: "USER_WALLET",
-        status: "ACTIVE"
-    });
-
-    if (!receiverAccount) {
-        throw new Error("Receiver account not found");
-    }
-
-
-    const receiverWallet = await Wallet.findOne({
-        accountId: receiverAccount._id
-    });
-
-    if (!receiverWallet) {
-        throw new Error("Receiver wallet not found");
-    }
-
-
-    // VALIDATE
-
-    /*
-     * Prevent transferring money to the same account.
-     */
-
-    if (senderAccount._id.equals(receiverAccount._id)) {
-        throw new Error(
-            "Cannot transfer money to your own account"
-        );
-    }
-
-
-    /*
-     * CREATE PAYMENT INTENT
-     *
-     * PaymentIntent is deliberately created outside the financial
-     * MongoDB transaction.
-     *
-     * This record must survive even if the financial transaction
-     * later rolls back or its commit result becomes unknown.
-     */
-
-    let paymentIntent;
-
-    try {
-
-        paymentIntent = await PaymentIntent.create({
-            userId: senderUserId,
-
-            senderAccountId: senderAccount._id,
-
-            receiverAccountId: receiverAccount._id,
-
-            amount,
-
-            currency: "INR",
-
-            idempotencyKey,
-
-            status: "PROCESSING"
-        });
-
-    } catch (err) {
-
-        /*
-         * Another concurrent request created the same PaymentIntent
-         * first.
-         *
-         * The unique index on:
-         *
-         *     { userId, idempotencyKey }
-         *
-         * allows only one request to become the owner of the
-         * payment.
-         */
-
-        if (err.code === 11000) {
-
-            const existingPaymentIntent =
-                await PaymentIntent.findOne({
-                    userId: senderUserId,
-                    idempotencyKey
-                });
-
-            if (!existingPaymentIntent) {
-                throw new Error(
-                    "PaymentIntent was not found after duplicate-key error"
-                );
-            }
-
-
-            if (
-                existingPaymentIntent.status === "PROCESSING"
-            ) {
-
-                throw new Error(
-                    "Payment is already in progress"
-                );
-            }
-
-
-            if (
-                existingPaymentIntent.status === "SUCCESS"
-            ) {
-
-                const existingTransaction =
-                    await Transaction.findById(
-                        existingPaymentIntent.transactionId
-                    );
-
-                if (!existingTransaction) {
-                    throw new Error(
-                        "PaymentIntent points to a missing transaction"
-                    );
-                }
-
-                return existingTransaction;
-            }
-
-
-            if (
-                existingPaymentIntent.status === "FAILED"
-            ) {
-
-                throw new Error(
-                    "Payment has already failed"
-                );
-            }
-
-
-            throw new Error(
-                "Unknown payment intent status"
-            );
-        }
-
-        throw err;
-    }
-
-
-    /*
-     * TRANSACTION ATTEMPTS
-     *
-     * A transient transaction conflict causes the
-     * entire transaction to be retried.
-     */
-
-    const MAX_ATTEMPTS = 3;
-
-    for (
-        let attempt = 1;
-        attempt <= MAX_ATTEMPTS;
-        attempt++
-    ) {
-
-        const session = await mongoose.startSession();
-
-        try {
-
-            session.startTransaction();
-
-
-            // IDENTIFY
-
-            /*
-             * Re-read the sender and receiver inside the transaction.
-             *
-             * These reads are part of the financial transaction and
-             * therefore participate in MongoDB's transaction isolation.
-             */
-
-            const transactionSenderUser =
-                await User
-                    .findById(senderUserId)
-                    .session(session);
-
-            if (!transactionSenderUser) {
-                throw new Error("No such user found");
-            }
-
-
-            const transactionSenderAccount =
-                await Account.findOne({
-                    userId: transactionSenderUser._id,
-                    accountType: "USER_WALLET",
-                    status: "ACTIVE"
-                }).session(session);
-
-            if (!transactionSenderAccount) {
-                throw new Error("Sender account not found");
-            }
-
-
-            const transactionSenderWallet =
-                await Wallet.findOne({
-                    userId: transactionSenderUser._id,
-                    accountId: transactionSenderAccount._id
-                }).session(session);
-
-            if (!transactionSenderWallet) {
-                throw new Error("Sender wallet not found");
-            }
-
-
-            const transactionReceiverAccount =
-                await Account.findOne({
-                    _id: receiverAccountId,
-                    accountType: "USER_WALLET",
-                    status: "ACTIVE"
-                }).session(session);
-
-            if (!transactionReceiverAccount) {
-                throw new Error("Receiver account not found");
-            }
-
-
-            const transactionReceiverWallet =
-                await Wallet.findOne({
-                    accountId: transactionReceiverAccount._id
-                }).session(session);
-
-            if (!transactionReceiverWallet) {
-                throw new Error("Receiver wallet not found");
-            }
-
-
-            // VALIDATE
-
-            /*
-             * Prevent transferring money to the same account.
-             */
-
-            if (
-                transactionSenderAccount._id.equals(
-                    transactionReceiverAccount._id
-                )
-            ) {
-                throw new Error(
-                    "Cannot transfer money to your own account"
-                );
-            }
-
-
-            // CREATE TRANSACTION
-
-            /*
-             * Create the Transaction record.
-             *
-             * Transaction = business event.
-             * LedgerEntry = accounting consequence.
-             *
-             * The transaction starts as INITIATED and becomes
-             * SUCCESS only after all financial operations succeed.
-             */
-
-            const transaction = await Transaction.create(
-                [{
-                    transactionId:
-                        `TXN-${Date.now()}-${Math.floor(
-                            Math.random() * 100000
-                        )}`,
-
-                    type: "P2P_TRANSFER",
-
-                    senderAccountId:
-                        transactionSenderAccount._id,
-
-                    receiverAccountId:
-                        transactionReceiverAccount._id,
-
-                    amount,
-
-                    currency: "INR",
-
-                    status: "INITIATED"
-                }],
-                { session }
-            );
-
-
-            /*
-             * create() returns an array when called with an array,
-             * so we extract the created Transaction document.
-             */
-
-            const createdTransaction = transaction[0];
-
-
-            /*
-             * Store the Transaction reference in the PaymentIntent.
-             *
-             * IMPORTANT:
-             *
-             * This update is part of the financial transaction.
-             *
-             * If the financial transaction rolls back,
-             * this transactionId update also rolls back.
-             *
-             * The PaymentIntent itself remains because it was created
-             * outside this transaction.
-             */
-
-            paymentIntent.transactionId =
-                createdTransaction._id;
-
-            await paymentIntent.save({ session });
-
-
-            // MOVE
-
-            /*
-             * Atomic conditional debit.
-             *
-             * MongoDB checks:
-             *
-             *     availableBalance >= amount
-             *
-             * and decrements the balance as one operation.
-             *
-             * This prevents the READ → CHECK → WRITE race.
-             */
-
-            const senderDebit = await Wallet.updateOne(
-                {
-                    _id: transactionSenderWallet._id,
-
-                    availableBalance: {
-                        $gte: amount
-                    }
-                },
-                {
-                    $inc: {
-                        availableBalance: -amount
-                    }
-                },
-                {
-                    session
-                }
-            );
-
-
-            if (senderDebit.modifiedCount === 0) {
-                throw new Error("Insufficient balance");
-            }
-
-
-            /*
-             * Credit receiver.
-             */
-
-            const receiverCredit =
-                await Wallet.updateOne(
-                    {
-                        _id: transactionReceiverWallet._id
-                    },
-                    {
-                        $inc: {
-                            availableBalance: amount
-                        }
-                    },
-                    {
-                        session
-                    }
-                );
-
-
-            if (receiverCredit.modifiedCount === 0) {
-                throw new Error(
-                    "Failed to credit receiver wallet"
-                );
-            }
-
-
-            // RECORD
-
-            await LedgerEntry.create(
-                [{
-                    transactionId:
-                        createdTransaction._id,
-
-                    accountId:
-                        transactionSenderAccount._id,
-
-                    entryType: "DEBIT",
-
-                    amount,
-
-                    currency: "INR"
-                }],
-                { session }
-            );
-
-
-            await LedgerEntry.create(
-                [{
-                    transactionId:
-                        createdTransaction._id,
-
-                    accountId:
-                        transactionReceiverAccount._id,
-
-                    entryType: "CREDIT",
-
-                    amount,
-
-                    currency: "INR"
-                }],
-                { session }
-            );
-
-
-            // COMPLETE
-
-            /*
-             * The financial transaction has completed all of its
-             * operations successfully.
-             *
-             * The SUCCESS status itself is still part of the
-             * MongoDB transaction and therefore is not durable
-             * until COMMIT succeeds.
-             */
-
-            createdTransaction.status = "SUCCESS";
-
-            await createdTransaction.save({ session });
-
-
-            // COMMIT
-
-            /*
-             * All payment operations are complete.
-             *
-             * If the result of COMMIT is unknown, retry ONLY
-             * the commit. Do NOT repeat the payment operations.
-             */
-
-            const MAX_COMMIT_ATTEMPTS = 3;
-
-            for (
-                let commitAttempt = 1;
-                commitAttempt <= MAX_COMMIT_ATTEMPTS;
-                commitAttempt++
-            ) {
-
-                try {
-
-                    await session.commitTransaction();
-
-                    break;
-
-                } catch (err) {
-
-                    if (
-                        err.hasErrorLabel &&
-                        err.hasErrorLabel(
-                            "UnknownTransactionCommitResult"
-                        )
-                    ) {
-
-                        /*
-                         * We don't know whether the commit
-                         * succeeded.
-                         *
-                         * Retry ONLY COMMIT.
-                         */
-
-                        if (
-                            commitAttempt <
-                            MAX_COMMIT_ATTEMPTS
-                        ) {
-                            continue;
-                        }
-
-
-                        /*
-                         * We have exhausted our commit retries.
-                         *
-                         * The financial transaction may have
-                         * committed or may have rolled back.
-                         *
-                         * Do NOT retry the payment.
-                         */
-
-                        err.code =
-                            "TRANSACTION_COMMIT_UNKNOWN";
-
-                        err.transactionId =
-                            createdTransaction.transactionId;
-
-                        err.idempotencyKey =
-                            idempotencyKey;
-
-                        throw err;
-                    }
-
-
-                    throw err;
-                }
-            }
-
-
-            /*
-             * COMMIT succeeded.
-             *
-             * The financial transaction is now definitely durable.
-             *
-             * Update the PaymentIntent outside the financial
-             * transaction.
-             */
-
-            try {
-
-                await PaymentIntent.findByIdAndUpdate(
-                    paymentIntent._id,
-                    {
-                        status: "SUCCESS",
-                        transactionId: createdTransaction._id
-                    }
-                );
-
-            } catch (err) {
-
-                /*
-                 * The payment itself has already committed.
-                 *
-                 * Therefore, a failure while updating the
-                 * PaymentIntent must NOT cause the payment to
-                 * be executed again.
-                 *
-                 * The PaymentIntent can be repaired later by
-                 * reconciliation.
-                 */
-
-            }
-
-
-            return createdTransaction;
-
-        } catch (err) {
-
-            /*
-             * Commit outcome is unknown.
-             *
-             * Do NOT retry the payment and do NOT start
-             * another transaction.
-             *
-             * PaymentIntent remains PROCESSING until its
-             * final outcome is resolved.
-             */
-
-            if (
-                err.code ===
-                "TRANSACTION_COMMIT_UNKNOWN"
-            ) {
-                throw err;
-            }
-
-
-            /*
-             * A transient transaction error means this
-             * transaction attempt cannot safely continue.
-             *
-             * Abort it and start a completely new attempt.
-             */
-
-            if (
-                err.hasErrorLabel &&
-                err.hasErrorLabel(
-                    "TransientTransactionError"
-                )
-            ) {
-
-                if (session.inTransaction()) {
-                    await session.abortTransaction();
-                }
-
-                continue;
-            }
-
-
-            /*
-             * All other errors are not automatically retryable.
-             *
-             * The financial transaction is aborted and the
-             * PaymentIntent is marked FAILED outside the
-             * financial transaction.
-             */
-
-            if (session.inTransaction()) {
-                await session.abortTransaction();
-            }
-
-
-            try {
-
-                await PaymentIntent.findByIdAndUpdate(
-                    paymentIntent._id,
-                    {
-                        status: "FAILED"
-                    }
-                );
-
-            } catch (paymentIntentError) {
-
-                /*
-                 * The payment itself was rolled back.
-                 *
-                 * Failure to update the PaymentIntent does not
-                 * change the financial outcome.
-                 */
-
-            }
-
-
-            throw err;
-
-        } finally {
-
-            await session.endSession();
-        }
-    }
-
-
-    /*
-     * All transaction attempts were exhausted.
-     *
-     * Every transient transaction attempt was aborted.
-     *
-     * Therefore, no financial transaction from these attempts
-     * was committed.
-     */
-
-    try {
-
-        await PaymentIntent.findByIdAndUpdate(
-            paymentIntent._id,
-            {
-                status: "FAILED"
-            }
-        );
-
-    } catch (err) {
-
-        /*
-         * The financial transaction attempts have already
-         * been exhausted and rolled back.
-         *
-         * PaymentIntent reconciliation can repair this record
-         * if this update itself fails.
-         */
-
-    }
-
-
-    throw new Error(
-        "Payment could not be completed after multiple attempts"
+    if (winner) return winner.transaction;
+
+    throw createServiceError(
+      "Payment request already exists and its status could not be loaded",
+      "PAYMENT_PROCESSING",
+      202
     );
-};
+  }
 
+  for (
+    let attempt = 1;
+    attempt <= MAX_TRANSACTION_ATTEMPTS;
+    attempt += 1
+  ) {
+    const session = await mongoose.startSession();
+
+    try {
+      session.startTransaction();
+
+      // Re-read the relevant records within this transaction attempt.
+      const accounts = await identifyAccounts({
+        senderUserId,
+        receiverAccountId,
+        session,
+      });
+
+      // Do not transfer if the account identity changed.
+      if (
+        !accounts.senderAccount._id.equals(
+          paymentIntent.senderAccountId
+        ) ||
+        !accounts.receiverAccount._id.equals(
+          paymentIntent.receiverAccountId
+        )
+      ) {
+        throw createServiceError(
+          "Payment account details changed; create a new payment request",
+          "PAYMENT_ACCOUNT_CHANGED",
+          409
+        );
+      }
+
+      // 1. Create the financial transaction record.
+      const transactionDocs = await Transaction.create(
+        [
+          {
+            transactionId: `TXN-${crypto.randomUUID()}`,
+            type: "P2P_TRANSFER",
+            senderAccountId: accounts.senderAccount._id,
+            receiverAccountId: accounts.receiverAccount._id,
+            amount,
+            currency: "INR",
+            status: "INITIATED",
+          },
+        ],
+        { session }
+      );
+
+      const createdTransaction = transactionDocs[0];
+
+      // 2. Debit the sender atomically.
+      // The balance check and decrement happen in one DB operation.
+      const debit = await Wallet.updateOne(
+        {
+          _id: accounts.senderWallet._id,
+          availableBalance: { $gte: amount },
+        },
+        {
+          $inc: { availableBalance: -amount },
+        },
+        { session }
+      );
+
+      if (debit.modifiedCount !== 1) {
+        throw createServiceError(
+          "Insufficient balance",
+          "INSUFFICIENT_BALANCE",
+          400
+        );
+      }
+
+      // 3. Credit the receiver.
+      const credit = await Wallet.updateOne(
+        { _id: accounts.receiverWallet._id },
+        {
+          $inc: { availableBalance: amount },
+        },
+        { session }
+      );
+
+      if (credit.modifiedCount !== 1) {
+        throw createServiceError(
+          "Receiver wallet could not be credited",
+          "RECEIVER_CREDIT_FAILED",
+          500
+        );
+      }
+
+      // 4. Record balanced double-entry ledger entries.
+      await LedgerEntry.create(
+        [
+          {
+            transactionId: createdTransaction._id,
+            accountId: accounts.senderAccount._id,
+            entryType: "DEBIT",
+            amount,
+            currency: "INR",
+          },
+          {
+            transactionId: createdTransaction._id,
+            accountId: accounts.receiverAccount._id,
+            entryType: "CREDIT",
+            amount,
+            currency: "INR",
+          },
+        ],
+        { session }
+      );
+
+      // 5. Mark the financial transaction successful within the transaction.
+      createdTransaction.status = "SUCCESS";
+      await createdTransaction.save({ session });
+
+      // 6. Link the PaymentIntent to the transaction.
+      // This link rolls back if the financial transaction aborts.
+      await PaymentIntent.updateOne(
+        { _id: paymentIntent._id },
+        {
+          $set: {
+            transactionId: createdTransaction._id,
+          },
+        },
+        { session }
+      );
+
+      // Commit handling is separate from transaction execution.
+      let commitConfirmed = false;
+
+      for (
+        let commitAttempt = 1;
+        commitAttempt <= MAX_COMMIT_ATTEMPTS;
+        commitAttempt += 1
+      ) {
+        try {
+          await session.commitTransaction();
+          commitConfirmed = true;
+          break;
+        } catch (error) {
+          if (
+            hasErrorLabel(
+              error,
+              "UnknownTransactionCommitResult"
+            )
+          ) {
+            // Retry the commit, not the payment operations.
+            if (commitAttempt < MAX_COMMIT_ATTEMPTS) {
+              continue;
+            }
+
+            error.code = "TRANSACTION_COMMIT_UNKNOWN";
+            error.transactionId =
+              createdTransaction.transactionId;
+            error.paymentIntentId = String(paymentIntent._id);
+            error.idempotencyKey = idempotencyKey;
+
+            throw error;
+          }
+
+          throw error;
+        }
+      }
+
+      if (!commitConfirmed) {
+        const error = createServiceError(
+          "Payment commit could not be confirmed",
+          "TRANSACTION_COMMIT_UNKNOWN",
+          202
+        );
+        error.transactionId = createdTransaction.transactionId;
+        error.paymentIntentId = String(paymentIntent._id);
+        error.idempotencyKey = idempotencyKey;
+        throw error;
+      }
+
+      // The financial commit is confirmed.
+      // This status update is deliberately outside the transaction.
+      try {
+        await PaymentIntent.updateOne(
+          { _id: paymentIntent._id },
+          {
+            $set: {
+              status: "SUCCESS",
+              transactionId: createdTransaction._id,
+            },
+          }
+        );
+      } catch (error) {
+        // Leave PROCESSING for reconciliation.
+        // Never execute the payment again because this update failed.
+      }
+
+      return createdTransaction;
+    } catch (error) {
+      // The commit may have succeeded even though confirmation failed.
+      // Do not mark FAILED or execute the payment again.
+      if (error.code === "TRANSACTION_COMMIT_UNKNOWN") {
+        throw error;
+      }
+
+      // A transient transaction error allows a bounded retry of the
+      // entire transaction, after aborting the current attempt.
+      if (hasErrorLabel(error, "TransientTransactionError")) {
+        if (session.inTransaction()) {
+          await session.abortTransaction();
+        }
+
+        if (attempt < MAX_TRANSACTION_ATTEMPTS) {
+          continue;
+        }
+
+        await markIntentFailedIfSafe(paymentIntent._id);
+
+        throw createServiceError(
+          "Payment could not be completed after multiple transaction attempts",
+          "TRANSACTION_RETRY_EXHAUSTED",
+          503
+        );
+      }
+
+      if (session.inTransaction()) {
+        await session.abortTransaction();
+      }
+
+      // Ordinary errors are marked FAILED after aborting the transaction.
+      await markIntentFailedIfSafe(paymentIntent._id);
+
+      throw error;
+    } finally {
+      await session.endSession();
+    }
+  }
+
+  throw createServiceError(
+    "Payment could not be completed",
+    "PAYMENT_FAILED",
+    500
+  );
+};
 
 module.exports = { createP2P };
