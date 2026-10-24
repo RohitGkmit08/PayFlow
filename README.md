@@ -2,10 +2,10 @@
 
 A production-style, UPI-inspired real-time financial wallet and transaction processing engine built with **Node.js**, **Express**, and **MongoDB (Mongoose)**.
 
-PayFlow demonstrates how modern, mission-critical payment systems handle high concurrency, distributed failures, and strict monetary accounting. The system enforces **ledger-based double-entry bookkeeping**, **multi-document ACID transactions**, **durable out-of-transaction idempotency**, **atomic conditional balance operations**, **two-tier distributed retry loops**, **fail-safe HTTP 202 commit escalation**, and **stateful SHA-256 hashed session security**.
+PayFlow demonstrates how modern, mission-critical payment systems handle high concurrency, distributed network partitions, and strict monetary accounting. The system enforces **ledger-based double-entry bookkeeping**, **multi-document ACID transactions**, **durable out-of-transaction idempotency with SHA-256 request fingerprinting**, **atomic conditional balance operations**, **two-tier distributed retry loops**, **fail-safe HTTP 202 commit escalation**, and **stateful SHA-256 hashed session security**.
 
 > [!NOTE]
-> **Learning-Focused Production Blueprint:** This repository is an educational, production-grade fintech reference implementation. While it adheres to real-world banking architecture principles, it operates in a simulated environment and is not connected to live external banking networks or NPCI/clearinghouses.
+> **Learning-Focused Production Blueprint:** This repository is an educational, production-grade fintech reference implementation. While it adheres to real-world banking architecture principles, it operates in a simulated environment and is not connected to live external banking networks or clearinghouses (e.g., NPCI, Fedwire, SEPA).
 
 ---
 
@@ -16,14 +16,15 @@ PayFlow demonstrates how modern, mission-critical payment systems handle high co
 - [Repository Structure](#repository-structure)
 - [Implementation Status](#implementation-status)
 - [Getting Started & Local Setup](#getting-started--local-setup)
-  - [Prerequisites](#prerequisites)
+  - [Prerequisites & Replica Set Requirement](#prerequisites--replica-set-requirement)
   - [Environment Configuration](#environment-configuration)
   - [Installation & Execution](#installation--execution)
 - [API Reference](#api-reference)
-  - [Health Check](#health-check)
-  - [Authentication Endpoints (`/api/auth`)](#authentication-endpoints)
-  - [Wallet Endpoints (`/api/wallet`)](#wallet-endpoints)
-  - [Payment Endpoints (`/api/payments`)](#payment-endpoints)
+  - [Health Check (`GET /`)](#health-check-get-)
+  - [Authentication Endpoints (`/api/auth`)](#authentication-endpoints-apiauth)
+  - [Wallet Endpoints (`/api/wallet`)](#wallet-endpoints-apiwallet)
+  - [Payment Endpoints (`/api/payments`)](#payment-endpoints-apipayments)
+- [End-to-End cURL Testing Walkthrough](#end-to-end-curl-testing-walkthrough)
 - [Financial Accounting Model](#financial-accounting-model)
   - [Entity Separation Architecture](#entity-separation-architecture)
   - [Double-Entry Accounting Invariant](#double-entry-accounting-invariant)
@@ -32,13 +33,13 @@ PayFlow demonstrates how modern, mission-critical payment systems handle high co
   - [Velocity Controls & Balance Ceilings](#velocity-controls--balance-ceilings)
 - [Transaction Engine & Concurrency Safety](#transaction-engine--concurrency-safety)
   - [End-to-End P2P Payment Pipeline](#end-to-end-p2p-payment-pipeline)
-  - [Durable PaymentIntent Pattern & Idempotency](#durable-paymentintent-pattern--idempotency)
+  - [Durable PaymentIntent Pattern & SHA-256 Fingerprinting](#durable-paymentintent-pattern--sha-256-fingerprinting)
   - [Atomic Conditional Balance Updates](#atomic-conditional-balance-updates)
-  - [Distributed Transaction Resilience (Two-Tier Retries)](#distributed-transaction-resilience-two-tier-retries)
+  - [Two-Tier Distributed Retry Resilience](#two-tier-distributed-retry-resilience)
   - [Unknown Commit State & HTTP 202 Escalation](#unknown-commit-state--http-202-escalation)
 - [Security & Authentication Hardening](#security--authentication-hardening)
 - [Database Models & Indexes](#database-models--indexes)
-- [Validation Rules](#validation-rules)
+- [Validation Rules (Zod)](#validation-rules-zod)
 - [Extended System Blueprint & Future Roadmap](#extended-system-blueprint--future-roadmap)
   - [Settlement & Finalization](#settlement--finalization)
   - [Transactional Outbox & Asynchronous Workers](#transactional-outbox--asynchronous-workers)
@@ -47,22 +48,24 @@ PayFlow demonstrates how modern, mission-critical payment systems handle high co
   - [Refunds, Reversals & Adjustments](#refunds-reversals--adjustments)
   - [Financial Invariants & Chaos Testing](#financial-invariants--chaos-testing)
   - [Deterministic Risk Engine & AI Layer](#deterministic-risk-engine--ai-layer)
+- [License](#license)
 
 ---
 
 ## Core Engineering Highlights
 
-- **Double-Entry Bookkeeping**: Every transaction generates balanced, immutable debit and credit ledger records ($\sum \text{Debits} = \sum \text{Credits}$). Wallets are mutable balance projections; the immutable ledger is the source of truth.
+- **Double-Entry Bookkeeping**: Every financial movement generates balanced, immutable debit and credit ledger records ($\sum \text{Debits} = \sum \text{Credits}$). Wallets are mutable balance projections; the immutable ledger is the authoritative source of truth.
 - **Strict Integer Arithmetic in Paise**: All balances, transaction amounts, and limits are stored and computed strictly as integers in Paise (1 INR = 100 Paise). Floating-point arithmetic is prohibited to prevent precision drift.
-- **Multi-Document ACID Transactions**: Distributed financial transactions run inside MongoDB replica set sessions (`session.startTransaction()`).
-- **Durable Out-of-Transaction PaymentIntent**: `PaymentIntent` records are created *before and outside* the MongoDB transaction session, ensuring that in-progress request locks, failure tracking, and idempotency records survive transaction rollbacks and write conflicts.
+- **Multi-Document ACID Transactions**: Distributed financial transactions execute inside MongoDB replica set sessions (`session.startTransaction()`) with snapshot isolation.
+- **Durable Out-of-Transaction PaymentIntent**: `PaymentIntent` records are created *before and outside* the MongoDB transaction session, ensuring that in-flight request locks, failure tracking, and idempotency records survive inner transaction aborts, rollbacks, and write conflicts.
+- **SHA-256 Request Fingerprinting**: The payload (`senderAccountId`, `receiverAccountId`, `amount`, `currency`) is canonicalized and hashed with SHA-256. Reusing an existing `Idempotency-Key` with altered payload parameters triggers an immediate HTTP `409 Conflict`.
 - **Concurrent Race Serialization**: Compound unique indexing on `{ userId, idempotencyKey }` catches duplicate simultaneous requests via database duplicate key errors (`E11000`), ensuring only one request executes while duplicates safely await or receive existing results.
 - **Zero-Overdraft Atomic Conditional Updates**: Balance deductions use MongoDB conditional atomic operators (`availableBalance: { $gte: amount }` with `$inc: -amount`) to eliminate READ-CHECK-WRITE race conditions and prevent overdrafts under high concurrency.
 - **Two-Tier Distributed Retry Resilience**:
-  - *Outer Loop*: Automatically handles `TransientTransactionError` (write conflicts, replica set elections) up to 3 attempts.
+  - *Outer Loop*: Automatically retries on `TransientTransactionError` (write conflicts, replica set elections) up to 3 attempts.
   - *Inner Commit Loop*: Automatically retries `UnknownTransactionCommitResult` up to 3 times without repeating monetary operations.
-- **Fail-Safe HTTP 202 Escalation**: When commit status remains ambiguous after exhausted commit retries, the system raises `TRANSACTION_COMMIT_UNKNOWN`, preserves the in-flight intent, and returns **HTTP 202 Accepted**, preventing blind retries and double debits.
-- **Stateful SHA-256 Session Security**: HttpOnly, SameSite cookie authentication using cryptographically generated 32-byte session tokens. The database stores strictly SHA-256 hashes, with native MongoDB TTL auto-cleanup after 7 days.
+- **Fail-Safe HTTP 202 Escalation**: When commit status remains ambiguous after exhausted commit retries, the system raises `TRANSACTION_COMMIT_UNKNOWN`, preserves the in-flight intent in `PROCESSING`, and returns **HTTP 202 Accepted**, preventing blind retries and double debits.
+- **Stateful SHA-256 Session Security**: `HttpOnly`, `SameSite=Lax` cookie authentication using cryptographically generated 32-byte session tokens. The database stores strictly SHA-256 hashes, with native MongoDB TTL auto-cleanup after 7 days.
 - **Tiered Financial Velocity Controls**: Hard constraints on single top-ups (₹50,000), cumulative daily top-ups (₹1,00,000), and wallet balance ceilings (₹2,00,000).
 - **Runtime Schema Validation**: Zero-trust request parsing powered by **Zod**.
 
@@ -71,16 +74,16 @@ PayFlow demonstrates how modern, mission-critical payment systems handle high co
 ## Tech Stack
 
 ### Implemented Backend Core
-- **Runtime & Framework:** Node.js (v18+), Express.js
-- **Database & ODM:** MongoDB (v5+ with Replica Set / MongoDB Atlas), Mongoose
-- **Validation & Security:** Zod, bcrypt, Node.js `crypto` (SHA-256, `randomBytes`)
+- **Runtime & Framework:** Node.js (v18+), Express.js (v4.x)
+- **Database & ODM:** MongoDB (v5+ with Replica Set / MongoDB Atlas), Mongoose (v9.x)
+- **Validation & Security:** Zod (v4.x), bcrypt (v6.x), Node.js `crypto` (SHA-256, `randomBytes`, `randomUUID`)
 - **Transport & Cookies:** `cors`, `cookie-parser`, `dotenv`
 - **Development Tooling:** Nodemon
 
 ### Planned Architecture Layers (Roadmap)
-- **Frontend Client:** React (Vite), React Query, Axios, CSS Modules / Vanilla CSS
-- **Asynchronous Processing:** Redis, BullMQ (Transactional Outbox relay & workers)
-- **AI Analytics & Insights:** Google Gemini API
+- **Frontend Client (`frontend/`):** React (Vite), React Query, Axios, CSS Modules
+- **Asynchronous Processing:** Redis, BullMQ (Transactional Outbox relay & background workers)
+- **AI Analytics & Insights:** Google Gemini API for spend categorization and natural language passbook summaries
 
 ---
 
@@ -100,7 +103,7 @@ PayFlow/
 │   │   │   └── auth.middleware.js    # SHA-256 session token cookie authenticator
 │   │   ├── models/
 │   │   │   ├── Accounts.js       # Financial accounts (USER_WALLET, BANK_SUSPENSE, etc.)
-│   │   │   ├── Idempotency.js    # Generic request deduplication model
+│   │   │   ├── Idempotency.js    # Request deduplication and replay protection store
 │   │   │   ├── LedgerEntry.js    # Immutable double-entry financial entries (DEBIT/CREDIT)
 │   │   │   ├── PaymentIntent.js  # Durable out-of-transaction payment tracking & idempotency
 │   │   │   ├── Session.js        # Stateful sessions with SHA-256 hashes & TTL auto-expiry
@@ -114,18 +117,22 @@ PayFlow/
 │   │   ├── services/
 │   │   │   ├── payment.service.js# Resilient P2P pipeline with ACID retries & atomicity
 │   │   │   └── wallet.service.js # Wallet funding service with velocity limit checks
-│   │   ├── utils/                # Utilities and helpers
+│   │   ├── utils/
+│   │   │   └── .gitkeep          # Helper utilities directory
 │   │   ├── validator/
 │   │   │   ├── addMoney.validator.js # Zod schema for wallet top-up payloads
 │   │   │   ├── auth.validator.js     # Zod schemas for registration and login
 │   │   │   └── payment.validator.js  # Zod schema for P2P payment requests
 │   │   ├── app.js                # Express application configuration and route bindings
 │   │   └── server.js             # Server bootstrap and database connection
-│   ├── .env.example              # Environment variables blueprint
+│   ├── .env                      # Local environment configuration (gitignored)
+│   ├── .env.example              # Blueprint for required environment variables
 │   ├── package.json              # Backend dependencies and execution scripts
+│   ├── package-lock.json         # Pinned dependency lockfile
 │   └── README.md                 # Detailed backend technical documentation
 ├── frontend/                     # Client application (Vite / React - in roadmap)
-├── notes.txt                     # Design notes and domain specifications
+├── notes.txt                     # Design notes, domain terms, and specifications
+├── .gitignore                    # Git ignore rules for node_modules, .env, and OS files
 └── README.md                     # Main repository documentation (this file)
 ```
 
@@ -135,30 +142,32 @@ PayFlow/
 
 | Component / Subsystem | Status | Implementation Details |
 | :--- | :--- | :--- |
-| **User Identity & Auth** |  **Implemented** | Bcrypt password hashing, stateful SHA-256 session tokens, `HttpOnly` cookies, 7-day TTL index, `/api/auth/register`, `/api/auth/login`, `/api/auth/me`. |
-| **Financial Accounting Model** |  **Implemented** | Separation of `User`, `Account`, `Wallet`, and `LedgerEntry`. Support for `USER_WALLET` and system accounts (`BANK_SUSPENSE`, `PLATFORM_REVENUE`, `SETTLEMENT_POOL`). |
-| **Paise Integer Representation** |  **Implemented** | Zero floating-point math; all balances and values stored as integers in Paise ($100 = ₹1.00$). |
+| **User Identity & Auth** |  **Implemented** | Bcrypt password hashing (cost factor 8), stateful SHA-256 session tokens, `HttpOnly` cookies, 7-day TTL index, `/api/auth/register`, `/api/auth/login`, `/api/auth/me`. |
+| **Financial Accounting Model** |  **Implemented** | Entity separation: `User`, `Account`, `Wallet`, `LedgerEntry`, `Transaction`, `PaymentIntent`. System accounts: `BANK_SUSPENSE`, `PLATFORM_REVENUE`, `SETTLEMENT_POOL`. |
+| **Paise Integer Arithmetic** |  **Implemented** | Zero floating-point numbers; all balances and values stored strictly as integers in Paise ($100 = ₹1.00$) with Mongoose integer validation. |
 | **Inbound Top-Up (`addMoney`)** |  **Implemented** | Debits `BANK_SUSPENSE`, credits `USER_WALLET`, updates balance snapshot, writes paired ledger entries, enforces ₹50k per-txn, ₹100k daily, and ₹200k balance caps. |
-| **Durable PaymentIntent Idempotency** |  **Implemented** | Out-of-transaction durable record with `{ userId, idempotencyKey }` unique compound index, surviving rollbacks and serializing concurrent races. |
-| **Atomic P2P Money Movement** |  **Implemented** | MongoDB ACID multi-document transactions, atomic conditional debit (`$gte` and `$inc`), balanced credit, paired immutable `DEBIT`/`CREDIT` ledger records. |
-| **Transaction Resilience & Retries** |  **Implemented** | Outer retry loop for `TransientTransactionError` (3x), inner commit-only loop for `UnknownTransactionCommitResult` (3x), HTTP 202 escalation on ambiguous commits. |
-| **Runtime Validation** |  **Implemented** | Zod schemas for registration, login, add-money, and payment requests. |
-| **Frontend UI (React/Vite)** |  *Roadmap* | Dashboard, passbook ledger view, send money modal, QR / VPA lookup. |
+| **Durable PaymentIntent Idempotency** |  **Implemented** | Out-of-transaction durable record with `{ userId, idempotencyKey }` unique compound index and SHA-256 request fingerprinting, surviving rollbacks and serializing concurrent races. |
+| **Atomic P2P Money Movement** |  **Implemented** | Multi-document ACID transactions, atomic conditional debit (`$gte` and `$inc`), balanced credit, paired immutable `DEBIT`/`CREDIT` ledger records. |
+| **Two-Tier Transaction Resilience** |  **Implemented** | Outer retry loop for `TransientTransactionError` (3x), inner commit-only loop for `UnknownTransactionCommitResult` (3x), HTTP 202 escalation on ambiguous commits. |
+| **Runtime Validation** |  **Implemented** | Zero-trust Zod schemas for registration, login, add-money, and payment requests. |
+| **Frontend UI (React/Vite)** |  *Roadmap* | Dashboard, passbook ledger view, send money modal, QR / VPA lookup (directory initialized in `frontend/`). |
 | **Transactional Outbox & Workers** |  *Blueprint* | Event-driven architecture with outbox relay, Redis, and BullMQ queues for settlement and notifications. |
-| **Reconciliation & External Simulator**|  *Blueprint* | External payment network simulator, batch/poll reconciliation, mismatch classification, automated reversal ledger entries. |
+| **Reconciliation & External Simulator**|  *Blueprint* | External payment network simulator, batch/poll reconciliation, mismatch classification, automated corrective ledger entries. |
 | **Deterministic Risk & Gemini AI** |  *Blueprint* | Deterministic policy evaluation (`ALLOW`, `VERIFY`, `REVIEW`, `REJECT`) + asynchronous Gemini financial insights. |
 
 ---
 
 ## Getting Started & Local Setup
 
-### Prerequisites
+### Prerequisites & Replica Set Requirement
 
 1. **Node.js**: `v18.x` or higher
 2. **npm**: `v9.x` or higher
 3. **MongoDB**: `v5.x` or higher with a **Replica Set** enabled.
    > [!IMPORTANT]
-   > MongoDB multi-document ACID transactions (`mongoose.startSession()`) require a replica set. If running locally, start `mongod` with `--replSet rs0`. Alternatively, a free cloud database cluster from [MongoDB Atlas](https://www.mongodb.com/atlas) has replica sets enabled out-of-the-box.
+   > MongoDB multi-document ACID transactions (`session.startTransaction()`) require a replica set.
+   > - If running MongoDB locally, start `mongod` with `--replSet rs0` and run `rs.initiate()`.
+   > - Alternatively, a free cloud database cluster from [MongoDB Atlas](https://www.mongodb.com/atlas) has replica sets pre-configured out-of-the-box.
 
 ### Environment Configuration
 
@@ -168,7 +177,7 @@ Create a `.env` file inside the `backend/` directory by copying `backend/.env.ex
 cp backend/.env.example backend/.env
 ```
 
-Set the required environment parameters in `backend/.env`:
+Configure your parameters in `backend/.env`:
 
 ```env
 PORT=5000
@@ -209,23 +218,24 @@ PayFlow API is running on port 5000
 
 ## API Reference
 
-### Health Check
+### Health Check (`GET /`)
 
-#### `GET /`
 Verifies backend service operational health.
 
-- **Request:** No parameters or authentication required.
+- **URL:** `/`
+- **Method:** `GET`
+- **Authentication:** None
 - **Response `200 OK`:**
-```json
-{
-  "message": "PayFlow Backend",
-  "status": "running"
-}
-```
+  ```json
+  {
+    "message": "PayFlow Backend",
+    "status": "running"
+  }
+  ```
 
 ---
 
-### Authentication Endpoints
+### Authentication Endpoints (`/api/auth`)
 
 Base Route: `/api/auth`
 
@@ -235,32 +245,33 @@ Base Route: `/api/auth`
 Creates a new user identity, automatically provisions a financial account of type `USER_WALLET`, and creates an associated `Wallet` with `0` balance within an atomic MongoDB transaction.
 
 - **Request Body:**
-```json
-{
-  "name": "Rohit Sinha",
-  "phone": "9876543210",
-  "email": "rohit@example.com",
-  "password": "SecurePassword123"
-}
-```
-*Validation Rules: `name` min 2 chars; `phone` exactly 10 digits; `email` valid format (optional); `password` min 6 chars.*
-
-- **Response `201 Created`:**
-```json
-{
-  "message": "User registered successfully",
-  "user": {
-    "id": "64b8f0f4a7c1b2c3d4e5f6a1",
+  ```json
+  {
     "name": "Rohit Sinha",
     "phone": "9876543210",
-    "email": "rohit@example.com"
+    "email": "rohit@example.com",
+    "password": "SecurePassword123"
   }
-}
-```
+  ```
+  *Validation Rules: `name` min 2 chars; `phone` exactly 10 digits; `email` valid format (optional, or empty string); `password` min 6 chars.*
+
+- **Response `201 Created`:**
+  ```json
+  {
+    "message": "User registered successfully",
+    "user": {
+      "id": "64b8f0f4a7c1b2c3d4e5f6a1",
+      "name": "Rohit Sinha",
+      "phone": "9876543210",
+      "email": "rohit@example.com"
+    }
+  }
+  ```
+
 - **Error Responses:**
-  - `400 Bad Request`: Payload validation failed.
-  - `409 Conflict`: Phone number or email already in use.
-  - `500 Internal Server Error`: Server failure.
+  - `400 Bad Request`: Payload validation failed (`"invalid registration data"`).
+  - `409 Conflict`: Phone number or email already in use (`"User already exists"`).
+  - `500 Internal Server Error`: Server failure (`"internal server error"`).
 
 ---
 
@@ -270,12 +281,12 @@ Creates a new user identity, automatically provisions a financial account of typ
 Authenticates credentials using `bcrypt.compare`, verifies that account status is `ACTIVE`, generates a cryptographically secure 32-byte session token, stores its SHA-256 hash in MongoDB, and delivers an `HttpOnly` cookie.
 
 - **Request Body:**
-```json
-{
-  "email": "rohit@example.com",
-  "password": "SecurePassword123"
-}
-```
+  ```json
+  {
+    "email": "rohit@example.com",
+    "password": "SecurePassword123"
+  }
+  ```
 
 - **Response `200 OK`:**
   - **Headers:**
@@ -294,11 +305,12 @@ Authenticates credentials using `bcrypt.compare`, verifies that account status i
       }
     }
     ```
+
 - **Error Responses:**
-  - `400 Bad Request`: Missing email or password.
-  - `401 Unauthorized`: Invalid credentials.
-  - `403 Forbidden`: User account is `BLOCKED`.
-  - `500 Internal Server Error`: Server error.
+  - `400 Bad Request`: Missing email or password (`"invalid login data"`).
+  - `401 Unauthorized`: Invalid credentials (`"invalid email or password"`).
+  - `403 Forbidden`: User account status is `BLOCKED` (`"account is blocked"`).
+  - `500 Internal Server Error`: Server failure.
 
 ---
 
@@ -309,24 +321,26 @@ Resolves the caller's identity via the active `sessionToken` cookie.
 
 - **Authentication:** Required (`sessionToken` cookie).
 - **Response `200 OK`:**
-```json
-{
-  "user": {
-    "id": "64b8f0f4a7c1b2c3d4e5f6a1",
-    "name": "Rohit Sinha",
-    "phone": "9876543210",
-    "email": "rohit@example.com",
-    "status": "ACTIVE"
+  ```json
+  {
+    "user": {
+      "id": "64b8f0f4a7c1b2c3d4e5f6a1",
+      "name": "Rohit Sinha",
+      "phone": "9876543210",
+      "email": "rohit@example.com",
+      "status": "ACTIVE"
+    }
   }
-}
-```
+  ```
+
 - **Error Responses:**
-  - `401 Unauthorized`: Missing, expired, or invalid session cookie.
-  - `404 Not Found`: User record not found.
+  - `401 Unauthorized`: Missing cookie (`"Authentication required"`), invalid session (`"invalid session"`), or expired session (`"session expired"`).
+  - `404 Not Found`: User record not found (`"User not found"`).
+  - `500 Internal Server Error`: Server error.
 
 ---
 
-### Wallet Endpoints
+### Wallet Endpoints (`/api/wallet`)
 
 Base Route: `/api/wallet`
 
@@ -336,13 +350,13 @@ Base Route: `/api/wallet`
 Loads funds into the authenticated user's wallet from the platform's external banking clearing account (`BANK_SUSPENSE`).
 
 **Execution & Accounting Lifecycle:**
-1. Resolves caller's `User`, `Account` (`USER_WALLET`), and `Wallet`.
+1. Resolves caller's `User`, active `Account` (`USER_WALLET`), and `Wallet`.
 2. Locates or initializes the platform `BANK_SUSPENSE` account.
 3. Evaluates velocity controls:
    - Single top-up cap: $\le 5,000,000$ Paise (₹50,000).
    - Maximum wallet balance ceiling: $\le 20,000,000$ Paise (₹2,00,000).
-   - Daily cumulative top-up limit: $\le 10,000,000$ Paise (₹1,00,000) for the current day.
-4. Generates a `Transaction` record (`type: "ADD_MONEY"`, `status: "INITIATED"`).
+   - Daily cumulative top-up limit: $\le 10,000,000$ Paise (₹1,00,000) for the current calendar day.
+4. Generates a `Transaction` record (`type: "ADD_MONEY"`, `status: "INITIATED"`, `id: TXN-<timestamp>-<rand>`).
 5. Increments `userWallet.availableBalance` by `amount`.
 6. Creates balanced double-entry records:
    - `DEBIT` on `BANK_SUSPENSE` account for `amount`.
@@ -351,90 +365,159 @@ Loads funds into the authenticated user's wallet from the platform's external ba
 
 - **Authentication:** Required (`sessionToken` cookie).
 - **Request Body:**
-```json
-{
-  "amount": 500000
-}
-```
-*Note: `amount` must be a positive integer in Paise (`500000` = ₹5,000.00).*
+  ```json
+  {
+    "amount": 500000
+  }
+  ```
+  *Note: `amount` must be a positive integer in Paise (`500000` = ₹5,000.00).*
 
 - **Response `201 Created`:**
-```json
-{
-  "message": "Money added successfully",
-  "transaction": {
-    "id": "TXN-1725807600000-84729",
-    "type": "ADD_MONEY",
-    "amount": 500000,
-    "currency": "INR",
-    "status": "SUCCESS"
+  ```json
+  {
+    "message": "Money added successfully",
+    "transaction": {
+      "id": "TXN-1725807600000-84729",
+      "type": "ADD_MONEY",
+      "amount": 500000,
+      "currency": "INR",
+      "status": "SUCCESS"
+    }
   }
-}
-```
+  ```
+
 - **Error Responses:**
   - `400 Bad Request`: Invalid amount format (non-integer or non-positive).
   - `401 Unauthorized`: Authentication required.
-  - `500 Internal Server Error`: Limit exceeded (`"Transaction amount limit exceeded"`, `"Daily add-money limit exceeded"`, `"Wallet balance limit exceeded"`).
+  - `500 Internal Server Error`: Limit exceeded or missing account (`"Transaction amount limit exceeded"`, `"Daily add-money limit exceeded"`, `"Wallet balance limit exceeded"`, `"User account not found"`).
 
 ---
 
-### Payment Endpoints
+### Payment Endpoints (`/api/payments`)
 
 Base Route: `/api/payments`
 
 #### 1. Execute Peer-to-Peer (P2P) Transfer
 `POST /api/payments`
 
-Transfers money atomically between two users' wallet accounts. Utilizes an out-of-transaction durable `PaymentIntent`, MongoDB multi-document ACID isolation, atomic conditional balance decrements, double-entry ledger entries, and two-tier retry resilience.
+Transfers money atomically between two users' wallet accounts. Utilizes an out-of-transaction durable `PaymentIntent`, SHA-256 request fingerprinting, MongoDB multi-document ACID isolation, atomic conditional balance decrements, double-entry ledger entries, and two-tier retry resilience.
 
 - **Authentication:** Required (`sessionToken` cookie).
 - **HTTP Headers:**
   ```http
   Idempotency-Key: <unique-client-uuid-or-id>
   ```
-  *(Mandatory in production. Enforces exactly-once execution across network retries and duplicate submits).*
+  *(Mandatory for safe retries. Enforces exactly-once execution across network retries and duplicate submits).*
 - **Request Body:**
-```json
-{
-  "receiverAccountId": "64b8f102a7c1b2c3d4e5f6b2",
-  "amount": 50000
-}
-```
-*Note: `amount` must be an integer in Paise (`50000` = ₹500.00). Sender is automatically resolved server-side from the authenticated session; client-supplied sender values are rejected.*
+  ```json
+  {
+    "receiverAccountId": "64b8f102a7c1b2c3d4e5f6b2",
+    "amount": 50000
+  }
+  ```
+  *Note: `amount` must be a positive integer in Paise (`50000` = ₹500.00). Sender is automatically resolved server-side from the authenticated session; client-supplied sender values are rejected.*
 
 - **Response `200 OK` (Payment Successful):**
-```json
-{
-  "message": "Payment successful",
-  "transaction": {
-    "id": "TXN-1725330000000-48291",
-    "amount": 50000,
-    "currency": "INR",
-    "status": "SUCCESS"
+  ```json
+  {
+    "message": "Payment successful",
+    "transaction": {
+      "id": "TXN-a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "amount": 50000,
+      "currency": "INR",
+      "status": "SUCCESS"
+    }
   }
-}
-```
-*(Also returned if an identical idempotency key is submitted whose payment previously reached `SUCCESS`).*
+  ```
+  *(Also returned if an identical idempotency key is submitted whose payment previously reached `SUCCESS`).*
 
-- **Response `202 Accepted` (Commit Status Ambiguous):**
-Returned when MongoDB commit attempts encounter `UnknownTransactionCommitResult` and cannot confirm whether the replica set finalized the write before network disruption. The `PaymentIntent` remains in `PROCESSING`. The client must not re-execute the transfer blindly.
-```json
-{
-  "message": "payment status could not be confirmed",
-  "status": "UNKNOWN",
-  "transactionId": "TXN-1725330000000-48291"
-}
-```
+- **Response `202 Accepted` (Commit Status Ambiguous / In-Progress):**
+  Returned when MongoDB commit attempts encounter `UnknownTransactionCommitResult` and cannot confirm whether the replica set finalized the write before network disruption. The `PaymentIntent` remains in `PROCESSING`. The client must not re-execute the transfer blindly.
+  ```json
+  {
+    "message": "payment status could not be confirmed",
+    "status": "UNKNOWN",
+    "transactionId": "TXN-a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+  }
+  ```
 
 - **Error Responses:**
-  - `400 Bad Request`: Missing receiver account ID or invalid amount.
-  - `401 Unauthorized`: Authentication required or invalid session.
-  - `500 Internal Server Error`: Business rule failure:
-    - `"Insufficient balance"`
-    - `"Cannot transfer money to your own account"`
-    - `"Payment is already in progress"`
-    - `"Payment has already failed"`
-    - `"Receiver account not found"`
+  - `400 Bad Request`: Input validation failed (`"Invalid input data"`), missing idempotency key (`"Idempotency-Key is required"`), or non-integer amount (`"Amount must be a positive safe integer representing paise"`).
+  - `401 Unauthorized`: Missing or invalid session cookie (`"Authentication required"`).
+  - `409 Conflict`: Idempotency key reused with altered payload (`"Idempotency-Key was already used with different payment details"`) or payment previously failed (`"This payment request has already failed"`).
+  - `500 Internal Server Error`: Business rule failure (`"Insufficient balance"`, `"Cannot transfer money to your own account"`, `"Receiver account not found"`, `"Receiver wallet could not be credited"`).
+
+---
+
+## End-to-End cURL Testing Walkthrough
+
+Follow this step-by-step cURL sequence to test the entire lifecycle locally:
+
+```bash
+# Set base URL
+BASE_URL="http://localhost:5000"
+
+# 1. Health Check
+curl -s -X GET "${BASE_URL}/"
+
+# 2. Register User A (Alice)
+curl -s -X POST "${BASE_URL}/api/auth/register" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Alice Sharma",
+    "phone": "9876543211",
+    "email": "alice@example.com",
+    "password": "Password123"
+  }'
+
+# 3. Register User B (Bob)
+curl -s -X POST "${BASE_URL}/api/auth/register" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Bob Verma",
+    "phone": "9876543212",
+    "email": "bob@example.com",
+    "password": "Password123"
+  }'
+
+# 4. Login User A (stores session cookie in alice_cookie.txt)
+curl -s -c alice_cookie.txt -X POST "${BASE_URL}/api/auth/login" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "alice@example.com",
+    "password": "Password123"
+  }'
+
+# 5. Check Profile of User A
+curl -s -b alice_cookie.txt -X GET "${BASE_URL}/api/auth/me"
+
+# 6. Add ₹500 (50,000 paise) to Alice's Wallet
+curl -s -b alice_cookie.txt -X POST "${BASE_URL}/api/wallet/add-money" \
+  -H "Content-Type: application/json" \
+  -d '{"amount": 50000}'
+
+# 7. Execute P2P Transfer from Alice to Bob's Account ID
+# (Replace BOB_ACCOUNT_ID with the actual Account _id created during Bob's registration)
+IDEMPOTENCY_KEY=$(uuidgen 2>/dev/null || echo "idem-$(date +%s)")
+BOB_ACCOUNT_ID="<BOB_ACCOUNT_ID>"
+
+curl -s -b alice_cookie.txt -X POST "${BASE_URL}/api/payments" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: ${IDEMPOTENCY_KEY}" \
+  -d "{
+    \"receiverAccountId\": \"${BOB_ACCOUNT_ID}\",
+    \"amount\": 20000
+  }"
+
+# 8. Retry with Same Idempotency Key (Demonstrates Idempotency - Returns Cached 200 OK)
+curl -s -b alice_cookie.txt -X POST "${BASE_URL}/api/payments" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: ${IDEMPOTENCY_KEY}" \
+  -d "{
+    \"receiverAccountId\": \"${BOB_ACCOUNT_ID}\",
+    \"amount\": 20000
+  }"
+```
 
 ---
 
@@ -442,29 +525,29 @@ Returned when MongoDB commit attempts encounter `UnknownTransactionCommitResult`
 
 ### Entity Separation Architecture
 
-PayFlow strictly separates human identity, financial accounting entities, fast mutable balance state, durable request intent, and immutable transaction audit logs:
+PayFlow strictly separates human identity, financial accounting entities, fast mutable balance projections, durable request intent, and immutable transaction audit logs:
 
 ```text
-                        USER (Identity & Credentials)
-                                     │
-                                     ▼
-                         ACCOUNT (Financial Entity)
+                         USER (Identity & Auth)
+                                   │
+                                   ▼
+                        ACCOUNT (Financial Entity)
                        (USER_WALLET, BANK_SUSPENSE,
                        PLATFORM_REVENUE, SETTLEMENT_POOL)
-                                     │
-          ┌──────────────────────────┼──────────────────────────┐
-          ▼                          ▼                          ▼
-    PAYMENT INTENT            LEDGER ENTRIES             WALLET (Balance)
-  (Durable Intent & Idemp)   (Immutable Ledger)     (Fast Mutable Projection)
-          │                          │
-          └─────────────► TRANSACTION ◄─────────────┘
-                       (Financial Event)
+                                   │
+        ┌──────────────────────────┼──────────────────────────┐
+        ▼                          ▼                          ▼
+  PAYMENT INTENT            LEDGER ENTRIES             WALLET (Balance)
+(Durable Request State)  (Immutable Audit Record)  (Fast Mutable Projection)
+        │                          │
+        └─────────────► TRANSACTION ◄─────────────┘
+                     (Financial Event)
 ```
 
-1. **User (`User`)**: Represents the human entity, holds login credentials, phone, and email. Has zero financial balance fields.
-2. **Account (`Account`)**: The accounting identity that participates in financial movements. A user holds an account of type `USER_WALLET`. Platform accounts (`BANK_SUSPENSE`, `PLATFORM_REVENUE`, `SETTLEMENT_POOL`) represent platform holdings and clearinghouses.
-3. **Wallet (`Wallet`)**: A fast, cached view of spendable balance for rapid dashboard loading. **The wallet is a mutable projection, not the financial source of truth.** If wallet state were ever lost or corrupted, it can be recomputed from ledger history.
-4. **PaymentIntent (`PaymentIntent`)**: The durable request state machine (`RECEIVED` → `PROCESSING` → `SUCCESS` / `FAILED`) created outside the financial transaction boundary. Survives rollbacks and anchors idempotency.
+1. **User (`User`)**: Represents the human identity holding login credentials (`hashPswd`), phone number, and email. Has zero financial balance fields.
+2. **Account (`Account`)**: The accounting identity that participates in financial movements. A user holds an account of type `USER_WALLET`. Platform accounts (`BANK_SUSPENSE`, `PLATFORM_REVENUE`, `SETTLEMENT_POOL`) represent platform holdings and clearing integrations.
+3. **Wallet (`Wallet`)**: A fast, cached view of available funds for rapid user balance queries. **The wallet is a mutable projection, not the financial source of truth; the ledger is.** If wallet balances ever desynchronize, they can be reconstructed from ledger history.
+4. **PaymentIntent (`PaymentIntent`)**: The durable request state machine (`RECEIVED` → `PROCESSING` → `SUCCESS` / `FAILED`) created outside the financial transaction boundary. Survives inner transaction aborts and anchors idempotency.
 5. **Transaction (`Transaction`)**: Represents a high-level business event (`P2P_TRANSFER`, `ADD_MONEY`) and tracks processing lifecycle (`INITIATED` → `PROCESSING` → `SUCCESS` / `FAILED` / `REVERSED`).
 6. **Ledger Entry (`LedgerEntry`)**: The immutable proof of money movement following double-entry bookkeeping. Every financial event generates paired debit and credit entries.
 
@@ -490,17 +573,17 @@ When a user loads ₹5,000 into their wallet from an external bank:
 ```
 
 #### 2. Peer-to-Peer Transfer (`P2P_TRANSFER`):
-When Rohit transfers ₹500 to Alice:
-- Rohit's `USER_WALLET` Account is **DEBITED** by ₹500 (`50000` Paise).
-- Alice's `USER_WALLET` Account is **CREDITED** by ₹500 (`50000` Paise).
-- Rohit's `Wallet.availableBalance` decrements by `50000` Paise.
-- Alice's `Wallet.availableBalance` increments by `50000` Paise.
+When Alice transfers ₹500 to Bob:
+- Alice's `USER_WALLET` Account is **DEBITED** by ₹500 (`50000` Paise).
+- Bob's `USER_WALLET` Account is **CREDITED** by ₹500 (`50000` Paise).
+- Alice's `Wallet.availableBalance` decrements by `50000` Paise.
+- Bob's `Wallet.availableBalance` increments by `50000` Paise.
 
 ```text
-[Rohit's Account] ──(DEBIT ₹500)──> [Alice's Account] ──(CREDIT ₹500)
-       │                                     │
-       ▼                                     ▼
-Rohit Balance -= ₹500               Alice Balance += ₹500
+[Alice's Account] ──(DEBIT ₹500)──> [Bob's Account] ──(CREDIT ₹500)
+       │                                   │
+       ▼                                   ▼
+Alice Balance -= ₹500              Bob Balance += ₹500
 ```
 
 ---
@@ -547,8 +630,8 @@ To defend against rapid balance inflation, fraud, and excessive risk exposure, w
 | **Cumulative Daily Top-Up** | ₹1,00,000 | `10,000,000` | `"Daily add-money limit exceeded"` |
 | **Max Wallet Balance Cap** | ₹2,00,000 | `20,000,000` | `"Wallet balance limit exceeded"` |
 
-- Daily limits aggregate all successful `ADD_MONEY` records for the user's account between `00:00:00.000` and `23:59:59.999` of the current day.
-- Balance caps assert that `availableBalance + amount <= MAX_WALLET_BALANCE` before initiating the transfer.
+- **Daily limit calculation**: Aggregates all successful `ADD_MONEY` records for the user's account between `00:00:00.000` and `23:59:59.999` of the current calendar day.
+- **Balance caps**: Verifies that `userWallet.availableBalance + amount <= MAX_WALLET_BALANCE` prior to initiating the movement.
 
 ---
 
@@ -565,21 +648,22 @@ To defend against rapid balance inflation, fraud, and excessive risk exposure, w
                      [1. Durable Idempotency Check]
                   PaymentIntent exists for {userId, K}?
                   ├── Yes:
-                  │   ├── PROCESSING? ──► Has txnId? ──► Return cached Transaction
-                  │   │                               └── Error: "Payment is already in progress"
+                  │   ├── PROCESSING? ──► Has txnId (SUCCESS)? ──► Return cached Transaction (200 OK)
+                  │   │                                        └── Throw 202: "Payment is still processing..."
                   │   ├── SUCCESS? ──► Return cached Transaction (200 OK)
-                  │   └── FAILED? ──► Error: "Payment has already failed"
+                  │   └── FAILED? ──► Throw 409: "This payment request has already failed"
                   └── No: Proceed
                                      │
                      [2. Pre-Transaction Resolution]
                      Resolve Sender (User, Account, Wallet)
                      Resolve Receiver (Account, Wallet)
                      Validate Sender Account != Receiver Account
+                     Compute SHA-256 Request Fingerprint
                                      │
                   [3. Create Durable PaymentIntent (Outside Session)]
                      Insert PaymentIntent (status: "PROCESSING")
                      ├── Duplicate Key (E11000 race)?
-                     │   └── Fetch existing PaymentIntent & resolve status
+                     │   └── Fetch existing PaymentIntent & resolve outcome
                      └── Success ──► Proceed to Transaction Loop
                                      │
                                      ▼
@@ -591,12 +675,12 @@ To defend against rapid balance inflation, fraud, and excessive risk exposure, w
                                      │
               1. IDENTIFY ───────────┤ Re-read Sender & Receiver within session (Snapshot Isolation)
               2. VALIDATE ───────────┤ Re-assert Sender Account != Receiver Account
-              3. CREATE TXN ─────────┤ Insert Transaction (status: "INITIATED")
-              4. LINK INTENT ────────┤ Set paymentIntent.transactionId = txn._id (in session)
-              5. MOVE ───────────────┤ Atomic Conditional Debit (availableBalance >= amount)
-                                     │ Credit Receiver Balance ($inc: amount)
-              6. RECORD ─────────────┤ Insert immutable DEBIT & CREDIT LedgerEntry records
-              7. COMPLETE ───────────┤ Set Transaction status = "SUCCESS"
+              3. CREATE TXN ─────────┤ Insert Transaction (status: "INITIATED", id: TXN-UUID)
+              4. DEBIT SENDER ───────┤ Atomic Conditional: availableBalance >= amount ($inc: -amount)
+              5. CREDIT RECEIVER ────┤ Atomic Update: $inc: { availableBalance: amount }
+              6. RECORD LEDGER ──────┤ Insert paired DEBIT and CREDIT LedgerEntry records
+              7. COMPLETE TXN ───────┤ Set Transaction status = "SUCCESS"
+              8. LINK INTENT ────────┤ Set paymentIntent.transactionId = txn._id (in session)
                                      │
                                      ▼
                  ┌───────────────────────────────────────┐
@@ -625,10 +709,10 @@ To defend against rapid balance inflation, fraud, and excessive risk exposure, w
 
 ---
 
-### Durable PaymentIntent Pattern & Idempotency
+### Durable PaymentIntent Pattern & SHA-256 Fingerprinting
 
 #### Why In-Transaction Idempotency Fails in Distributed Systems
-Traditional systems record idempotency tokens inside the ACID transaction session. This presents a critical flaw:
+In traditional transaction architectures, idempotency tokens are recorded inside the transaction session. This presents a critical flaw:
 - If a transaction aborts (e.g. write conflict, transient network blip, or balance check failure), **the idempotency record rolls back alongside the monetary changes**.
 - The database loses all memory that an attempt occurred.
 - A client retry arrives as a completely fresh request, creating vulnerability to double-spending or untraceable state.
@@ -647,6 +731,19 @@ PaymentIntent States:
                               └──(Commit Unknown)──────► [PROCESSING (Pending Reconciliation)]
 ```
 
+#### SHA-256 Request Fingerprinting
+To prevent a client from maliciously or accidentally reusing an `Idempotency-Key` with different payment parameters, PayFlow computes a canonical SHA-256 fingerprint:
+```javascript
+const canonicalRequest = JSON.stringify({
+  senderAccountId: String(senderAccountId),
+  receiverAccountId: String(receiverAccountId),
+  amount,
+  currency,
+});
+const requestFingerprint = crypto.createHash("sha256").update(canonicalRequest).digest("hex");
+```
+If an incoming request presents an existing key with mismatched parameters, it is rejected immediately with HTTP `409 Conflict` (`IDEMPOTENCY_KEY_REUSED`).
+
 #### Concurrency Race Resolution via Compound Unique Index
 The `PaymentIntent` collection enforces a compound unique index:
 ```javascript
@@ -659,9 +756,9 @@ When two identical requests arrive simultaneously:
 1. The first request inserts the `PaymentIntent` with status `"PROCESSING"` and claims execution ownership.
 2. The concurrent duplicate request hits MongoDB duplicate key error `E11000`.
 3. The catch block handles `E11000` by querying the winning `PaymentIntent`:
-   - If still `"PROCESSING"`, returns `"Payment is already in progress"`.
-   - If completed (`"SUCCESS"`), fetches and returns the cached `Transaction` immediately.
-   - If failed (`"FAILED"`), returns `"Payment has already failed"`.
+   - If still `"PROCESSING"`, returns HTTP `202 Accepted` (`"Payment is still processing or its outcome is unresolved"`).
+   - If completed (`"SUCCESS"`), fetches and returns the cached `Transaction` immediately (`200 OK`).
+   - If failed (`"FAILED"`), returns HTTP `409 Conflict` (`"This payment request has already failed"`).
 
 ---
 
@@ -673,7 +770,7 @@ PayFlow prevents the classic READ-CHECK-WRITE double-spend race condition by uti
 // ATOMIC DEBIT: Balance check and decrement in a single database operation
 const senderDebit = await Wallet.updateOne(
   {
-    _id: senderWallet._id,
+    _id: accounts.senderWallet._id,
     availableBalance: { $gte: amount }
   },
   {
@@ -682,8 +779,8 @@ const senderDebit = await Wallet.updateOne(
   { session }
 );
 
-if (senderDebit.modifiedCount === 0) {
-  throw new Error("Insufficient balance");
+if (senderDebit.modifiedCount !== 1) {
+  throw createServiceError("Insufficient balance", "INSUFFICIENT_BALANCE", 400);
 }
 ```
 
@@ -693,14 +790,15 @@ if (senderDebit.modifiedCount === 0) {
 
 ---
 
-### Distributed Transaction Resilience (Two-Tier Retries)
+### Two-Tier Distributed Retry Resilience
 
 Distributed replica sets can experience transient network partitions or write conflicts under load. PayFlow implements a two-tier retry strategy:
 
 #### 1. Whole-Transaction Retries (`TransientTransactionError`)
-- Governed by `MAX_ATTEMPTS = 3`.
+- Governed by `MAX_TRANSACTION_ATTEMPTS = 3`.
 - Catches MongoDB errors with the label `TransientTransactionError` (write conflicts, replica set elections).
 - Aborts the failed session cleanly, acquires a fresh session, and restarts the transaction pipeline.
+- If retries are exhausted, transitions `PaymentIntent.status = "FAILED"` and raises `TRANSACTION_RETRY_EXHAUSTED` (HTTP 503).
 
 #### 2. Commit-Only Retries (`UnknownTransactionCommitResult`)
 - Governed by `MAX_COMMIT_ATTEMPTS = 3`.
@@ -714,18 +812,19 @@ Distributed replica sets can experience transient network partitions or write co
 If all 3 commit attempts fail to confirm the outcome:
 1. The service tags the error with metadata:
    ```javascript
-   err.code = "TRANSACTION_COMMIT_UNKNOWN";
-   err.transactionId = createdTransaction.transactionId;
-   err.idempotencyKey = idempotencyKey;
+   error.code = "TRANSACTION_COMMIT_UNKNOWN";
+   error.transactionId = createdTransaction.transactionId;
+   error.paymentIntentId = String(paymentIntent._id);
+   error.idempotencyKey = idempotencyKey;
    ```
-2. The outer retry loop recognizes `err.code === "TRANSACTION_COMMIT_UNKNOWN"` and intentionally avoids re-executing the transaction.
-3. The `PaymentIntent` intentionally remains in `status: "PROCESSING"`. Any subsequent retry with the same key is blocked with `"Payment is already in progress"`.
+2. The outer retry loop recognizes `error.code === "TRANSACTION_COMMIT_UNKNOWN"` and intentionally avoids re-executing the transaction or marking it failed.
+3. The `PaymentIntent` intentionally remains in `status: "PROCESSING"`. Any subsequent retry with the same key safely blocks with HTTP `202 Accepted`.
 4. The payment controller catches this error and returns **HTTP 202 Accepted**:
    ```json
    {
      "message": "payment status could not be confirmed",
      "status": "UNKNOWN",
-     "transactionId": "TXN-1725330000000-48291"
+     "transactionId": "TXN-a1b2c3d4-e5f6-7890-abcd-ef1234567890"
    }
    ```
 5. This informs the client application that the payment was accepted, but the final outcome is pending verification. The client must not re-submit a new payment blindly.
@@ -756,7 +855,7 @@ Client (Browser)                       Backend API                          Mong
 
 - **Cryptographic Token Generation**: 64-character hex token generated via `crypto.randomBytes(32)`.
 - **Hashed Storage**: MongoDB stores only the **SHA-256 hash** (`sessionTokenHash`). Even if the database is leaked, valid session tokens cannot be derived.
-- **Cookie Flags**: Delivered with `HttpOnly: true` (blocking client-side JavaScript access) and `SameSite: "lax"`.
+- **Cookie Flags**: Delivered with `HttpOnly: true` (blocking client-side JavaScript access), `SameSite: "lax"`, and `secure: true` in production environments.
 - **Automatic TTL Expiry**: Sessions expire after 7 days via a native MongoDB TTL index on `expiresAt`.
 - **Zero-Trust Identity**: Senders are resolved strictly server-side from `req.userId` attached by `authMiddleware`. Request body sender parameters are never trusted.
 
@@ -769,13 +868,13 @@ Client (Browser)                       Backend API                          Mong
 | Model | Collection | Primary Responsibility | Key Attributes |
 | :--- | :--- | :--- | :--- |
 | **`User`** | `users` | Human identity & login credentials | `name`, `phone` (unique), `email` (sparse, unique), `hashPswd`, `status` (`ACTIVE`, `BLOCKED`) |
-| **`Account`** | `accounts` | Financial accounting identity | `userId` (ref `User`, null for system), `accountType` (`USER_WALLET`, `BANK_SUSPENSE`, `PLATFORM_REVENUE`, `SETTLEMENT_POOL`), `currency`, `status` |
+| **`Account`** | `accounts` | Financial accounting identity | `userId` (ref `User`, null for system accounts), `accountType` (`USER_WALLET`, `BANK_SUSPENSE`, `PLATFORM_REVENUE`, `SETTLEMENT_POOL`), `currency` (`INR`), `status` (`ACTIVE`, `BLOCKED`, `CLOSED`) |
 | **`Wallet`** | `wallets` | Fast mutable balance projection | `userId` (unique), `accountId` (ref `Account`, unique), `availableBalance` (integer Paise, $\ge 0$) |
-| **`PaymentIntent`** | `paymentintents` | Durable request state & idempotency | `userId`, `senderAccountId`, `receiverAccountId`, `amount` (Paise), `currency`, `idempotencyKey`, `transactionId`, `status` (`RECEIVED`, `PROCESSING`, `SUCCESS`, `FAILED`) |
-| **`Transaction`** | `transactions` | Business event record | `transactionId` (unique), `type` (`P2P_TRANSFER`, `ADD_MONEY`), `senderAccountId`, `receiverAccountId`, `amount`, `status` (`INITIATED`, `PROCESSING`, `SUCCESS`, `FAILED`, `REVERSED`) |
-| **`LedgerEntry`** | `ledgerentries` | Immutable double-entry financial record | `transactionId` (ref `Transaction`), `accountId` (ref `Account`), `entryType` (`DEBIT`, `CREDIT`), `amount` (Paise), `currency` |
-| **`Session`** | `sessions` | Active authenticated device session | `userId` (ref `User`), `sessionTokenHash` (unique), `expiresAt` (TTL), `revokedAt` |
-| **`IdempotencyKey`** | `idempotencykeys`| Request deduplication store | `userId`, `key`, `requestFingerprint`, `status` (`IN_PROGRESS`, `COMPLETED`), `transactionId`, `response`, `expiresAt` (TTL) |
+| **`PaymentIntent`** | `paymentintents` | Durable request state & idempotency | `userId`, `senderAccountId`, `receiverAccountId`, `amount` (Paise), `currency`, `idempotencyKey`, `requestFingerprint`, `transactionId`, `status` (`RECEIVED`, `PROCESSING`, `SUCCESS`, `FAILED`) |
+| **`Transaction`** | `transactions` | Business event record | `transactionId` (unique `TXN-...`), `type` (`P2P_TRANSFER`, `ADD_MONEY`), `senderAccountId`, `receiverAccountId`, `amount`, `status` (`INITIATED`, `PROCESSING`, `SUCCESS`, `FAILED`, `REVERSED`), `failureReason` |
+| **`LedgerEntry`** | `ledgerentries` | Immutable double-entry financial record | `transactionId` (ref `Transaction`), `accountId` (ref `Account`), `entryType` (`DEBIT`, `CREDIT`), `amount` (Paise), `currency` (`INR`) |
+| **`Session`** | `sessions` | Active authenticated device session | `userId` (ref `User`), `sessionTokenHash` (unique), `expiresAt` (TTL index), `revokedAt` |
+| **`IdempotencyKey`** | `idempotencykeys`| General request deduplication store | `userId`, `key`, `requestFingerprint`, `status` (`IN_PROGRESS`, `COMPLETED`), `transactionId`, `response`, `expiresAt` (TTL index) |
 
 ### Database Index Specifications
 
@@ -791,7 +890,7 @@ sessions.expiresAt: { expireAfterSeconds: 0 }  // Native MongoDB TTL cleanup
 // Durable Idempotency
 paymentintents.{ userId: 1, idempotencyKey: 1 }: { unique: true }
 idempotencykeys.{ userId: 1, key: 1 }: { unique: true }
-idempotencykeys.expiresAt: { expireAfterSeconds: 0 }
+idempotencykeys.expiresAt: { expireAfterSeconds: 0 } // Native MongoDB TTL cleanup
 
 // Financial Audit & Query Performance
 transactions.transactionId: { unique: true }
@@ -801,7 +900,7 @@ ledgerentries.accountId: { index: true }
 
 ---
 
-## Validation Rules
+## Validation Rules (Zod)
 
 Incoming requests are strictly validated using **Zod** before executing business logic:
 
@@ -809,9 +908,9 @@ Incoming requests are strictly validated using **Zod** before executing business
 | :--- | :--- | :--- | :--- | :--- |
 | `registerSchema` | `validator/auth.validator.js` | `name` | String, trimmed, min 2 characters | `"Name must contain at least 2 characters"` |
 | `registerSchema` | `validator/auth.validator.js` | `phone` | String, 10-digit regex (`^\d{10}$`) | `"Phone must be a valid 10-digit number"` |
-| `registerSchema` | `validator/auth.validator.js` | `email` | Optional, trimmed, valid email format | `"Invalid email address"` |
+| `registerSchema` | `validator/auth.validator.js` | `email` | Optional, trimmed, lowercase, valid email | `"Invalid email address"` |
 | `registerSchema` | `validator/auth.validator.js` | `password` | String, min 6 characters | `"Password must contain at least 6 characters"` |
-| `loginSchema` | `validator/auth.validator.js` | `email` | String, trimmed, valid email format | `"Invalid email address"` |
+| `loginSchema` | `validator/auth.validator.js` | `email` | String, trimmed, lowercase, valid email | `"Invalid email address"` |
 | `loginSchema` | `validator/auth.validator.js` | `password` | String, min 1 character | `"Password is required"` |
 | `addMoneySchema` | `validator/addMoney.validator.js` | `amount` | Number, integer, strictly positive ($> 0$) | `"Number must be positive"`, `"amount must be greater than 0"` |
 | `paymentSchema` | `validator/payment.validator.js` | `receiverAccountId` | String, non-empty | `"reciever account ID is required"` |
@@ -836,7 +935,7 @@ Payment Instruction ──► Local SUCCESS ──► Settlement Record (PENDING
 ```
 
 - **Settlement States:** `PENDING` → `SETTLED` / `FAILED` / `INVESTIGATING`.
-- **Settlement Pool Account:** Uses `SETTLEMENT_POOL` system accounts to track pooled bank liabilities during multi-party batch settlement.
+- **Settlement Pool Account:** Uses `SETTLEMENT_POOL` system accounts to track pooled liabilities during multi-party batch settlement.
 
 ---
 
